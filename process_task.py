@@ -145,7 +145,12 @@ def extract_service_name(cell_text: str) -> str:
 
     name_parts: list[str] = []
     for i, word in enumerate(words):
-        plain = word.rstrip(".,;:").strip()
+        # Word containing ':' is a description label (e.g. "Stitching:") — service
+        # names never contain colons, so stop without including this word.
+        if ":" in word:
+            break
+
+        plain = word.rstrip(".,;").strip()
         if not plain:
             continue
 
@@ -154,15 +159,16 @@ def extract_service_name(cell_text: str) -> str:
             continue
 
         first = plain[0]
-        if first.islower():             # current word is lowercase → description started before it
+        if first.islower():             # description started before this word
             break
 
-        # Current word is TitleCase. Check if it's the boundary (TC followed by lowercase):
-        # if so, this word is the FIRST word of the description, not part of the name.
+        # Current word is TitleCase. If the next word is lowercase, the description
+        # starts at the next word — but the current word may itself be the first
+        # description word (e.g. "Some stains..."), so skip it too.
         if i + 1 < len(words):
             next_plain = words[i + 1].rstrip(".,;:").strip()
             if next_plain and next_plain[0].islower():
-                break   # do NOT append — current word is description start
+                break
 
         name_parts.append(word)
 
