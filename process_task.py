@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import json
+import html as _html
 import requests
 from datetime import datetime, timedelta, date
 from typing import Optional
@@ -302,9 +303,17 @@ def process_task(task_id: str) -> None:
     print(f"  Stains:      text={'yes' if data['stains_text'] else 'no'}, photos={len(data['stains_photos'])}")
     print(f"  Internal:    {'yes' if data['internal_notes'] else 'no'}")
 
-    # 4. Deduplication: skip if any existing subtask name matches an approved service
+    # 4. Deduplication
+    # Primary signal: description already contains "Approved by customer" — this
+    # is robust because the line stays in the description even if subtasks get
+    # deleted. Secondary signal: any existing subtask name matches an approved
+    # service (catches edge cases where the marker was removed manually).
     approved_active = [s for s in data["approved_services"] if not s["removed"]]
     approved_names_lc = {s["name"].lower() for s in approved_active}
+
+    if "Approved by customer" in notes:
+        print("Already processed (description has 'Approved by customer'). Skipping.")
+        return
 
     existing_subtasks = list_subtasks(task_id)
     existing_names_lc = {(s.get("name") or "").strip().lower() for s in existing_subtasks}
@@ -336,17 +345,20 @@ def process_task(task_id: str) -> None:
     update_task(task_id, task_update)
 
     # 7. Stains & damages comment
+    # Asana comment HTML allows: <body>, <strong>, <em>, <u>, <s>, <code>, <ol>,
+    # <ul>, <li>, <a>, <blockquote>, <pre>. <p> is NOT allowed — using <blockquote>.
+    # All user-provided text is escaped so embedded < > & don't break parsing.
     if data["stains_text"] or data["stains_photos"]:
         print("Adding 'Stains & Damages' comment...")
         html_parts = ["<body><strong>Stains &amp; Damages</strong>"]
         if data["stains_text"]:
-            for para in data["stains_text"].split("\n\n"):
-                if para.strip():
-                    html_parts.append(f"<p>{para.strip()}</p>")
+            text_safe = _html.escape(data["stains_text"])
+            html_parts.append(f"<blockquote>{text_safe}</blockquote>")
         if data["stains_photos"]:
             html_parts.append("<ul>")
-            for url in data["stains_photos"]:
-                html_parts.append(f'<li><a href="{url}">Photo</a></li>')
+            for i, url in enumerate(data["stains_photos"], 1):
+                url_safe = _html.escape(url, quote=True)
+                html_parts.append(f'<li><a href="{url_safe}">Photo {i}</a></li>')
             html_parts.append("</ul>")
         html_parts.append("</body>")
         add_comment(task_id, "".join(html_parts))
@@ -355,9 +367,11 @@ def process_task(task_id: str) -> None:
     for svc in approved_active:
         if svc.get("photo_url"):
             print(f"Adding photo comment for: {svc['name']}")
+            name_safe = _html.escape(svc["name"])
+            url_safe  = _html.escape(svc["photo_url"], quote=True)
             html = (
-                f"<body><strong>{svc['name']}</strong>"
-                f'<p><a href="{svc["photo_url"]}">View photo</a></p>'
+                f"<body><strong>{name_safe}</strong>"
+                f"<ul><li><a href=\"{url_safe}\">View photo</a></li></ul>"
                 f"</body>"
             )
             add_comment(task_id, html)
