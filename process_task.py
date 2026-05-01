@@ -176,93 +176,150 @@ def extract_service_name(cell_text: str) -> str:
     return " ".join(name_parts).strip()
 
 
+def _clean_entries(block: str) -> list[str]:
+    """Parse a section that contains numbered entries with metadata.
+
+    Each entry on the page renders as:
+        1.   email@example.com 01 May, 14:46
+        <blank line>
+        <actual content, possibly multiple lines>
+        <blank line>
+        2.   email@example.com 01 May, 14:46
+        ...
+
+    Returns a list of cleaned content strings (numbering, email, and
+    timestamp removed). Also strips "Section N" labels which leak into
+    section content.
+    """
+    if not block:
+        return []
+
+    # Strip "Section N" lines and any photo/link markdown
+    cleaned = re.sub(r"^Section\s+\d+\s*$", "", block, flags=re.MULTILINE)
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", cleaned)        # ![alt](url)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)    # [text](url)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return []
+
+    # Each entry: "<num>. <email>... <timestamp>\n+<content until next entry>"
+    pattern = r"^\d+\.\s+\S+@\S+\s+[^\n]+\n+(.+?)(?=^\d+\.\s+\S+@|\Z)"
+    matches = re.findall(pattern, cleaned, flags=re.MULTILINE | re.DOTALL)
+
+    if matches:
+        return [re.sub(r"\s+", " ", m).strip() for m in matches if m.strip()]
+
+    # Fallback for free-text sections (no numbered entries)
+    flat = re.sub(r"\s+", " ", cleaned).strip()
+    return [flat] if flat else []
+
+
 def parse_page(text: str) -> dict:
     """Parse the rendered Service Wizard markdown into structured data."""
     data: dict = {
+        "is_rejected":       False,
+        "rejector_name":     None,
+        "rejected_at":       None,
+        "rejection_reason":  None,    # e.g. "Pricing", "Turn around time"
         "approver_name":     None,
         "approver_time":     None,
-        "approver_type":     None,   # "Customer" or "Facility"
-        "approved_services": [],     # [{name, tat_days, price, photo_url, removed}]
+        "approver_type":     None,    # "Customer" or "Facility"
+        "approved_services": [],      # [{name, tat_days, price, photo_url, removed}]
         "total_tat":         None,
         "total_price":       None,
-        "stains_text":       None,
+        "stains_entries":    [],      # cleaned strings, no metadata
         "stains_photos":     [],
-        "internal_notes":    None,
+        "internal_entries":  [],      # cleaned strings, no metadata
     }
 
-    # Approver type: "Final approved scope(v1 · Customer)" or "(v2 · Facility)"
-    m = re.search(
-        r"Final approved scope\s*\(\s*v?\d*\s*·\s*(Customer|Facility)\s*\)",
-        text, re.IGNORECASE,
+    # ── Rejection detection ──────────────────────────────────────────────────
+    # Format on rejected pages:  "Customer rejected\n\n<Reason>\n\n<Name>·<Time>"
+    rej_m = re.search(
+        r"Customer rejected\s*\n+([^\n]+?)\s*\n+([^·\n]+?)·\s*([^\n]+)",
+        text,
     )
-    if m:
-        data["approver_type"] = m.group(1)
+    if rej_m:
+        data["is_rejected"]      = True
+        data["rejection_reason"] = rej_m.group(1).strip()
+        data["rejector_name"]    = rej_m.group(2).strip()
+        data["rejected_at"]      = rej_m.group(3).strip()
+    elif re.search(r"Customer rejected", text, re.IGNORECASE):
+        data["is_rejected"] = True   # detected but couldn't parse details
 
-    # Approver line: "Approved by Haris Velijevic · 01 May, 10:50"
-    m = re.search(r"Approved by\s+([^·\n]+?)\s*·\s*([^\n]+)", text)
-    if m:
-        data["approver_name"] = m.group(1).strip()
-        data["approver_time"] = m.group(2).strip()
+    # ── Approval metadata ────────────────────────────────────────────────────
+    if not data["is_rejected"]:
+        m = re.search(
+            r"Final approved scope\s*\(\s*v?\d*\s*·\s*(Customer|Facility)\s*\)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            data["approver_type"] = m.group(1)
 
-    # Final Approved Scope table — isolate the section
-    section_m = re.search(
-        r"Final approved scope.*?\n(.+?)(?=\nApproved by|\nQuote history|\n##|\Z)",
+        m = re.search(r"Approved by\s+([^·\n]+?)\s*·\s*([^\n]+)", text)
+        if m:
+            data["approver_name"] = m.group(1).strip()
+            data["approver_time"] = m.group(2).strip()
+
+    # ── Approved services table (only meaningful on approved pages) ──────────
+    if not data["is_rejected"]:
+        section_m = re.search(
+            r"Final approved scope.*?\n(.+?)(?=\nApproved by|\nQuote history|\n##|\Z)",
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        if section_m:
+            table = section_m.group(1)
+            for row in re.finditer(
+                r"^\|\s*(.+?)\s*\|\s*(?:(\d+)d|—|-)\s*\|\s*AED\s+([\d.]+)\s*\|",
+                table, re.MULTILINE,
+            ):
+                cell    = row.group(1)
+                tat_str = row.group(2)
+                price   = float(row.group(3))
+                cell_lc = cell.strip().lower().replace("*", "")
+
+                if cell_lc == "service":         continue   # header
+                if cell_lc.startswith("---"):    continue   # md separator
+                if cell_lc.startswith("total"):
+                    data["total_price"] = price
+                    if tat_str:
+                        data["total_tat"] = int(tat_str)
+                    continue
+
+                photo_m   = re.search(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", cell)
+                photo_url = photo_m.group(1) if photo_m else None
+                svc_name  = extract_service_name(cell)
+                removed   = "removed by customer" in cell.lower()
+
+                if svc_name:
+                    data["approved_services"].append({
+                        "name":      svc_name,
+                        "tat_days":  int(tat_str) if tat_str else None,
+                        "price":     price,
+                        "photo_url": photo_url,
+                        "removed":   removed,
+                    })
+
+    # ── Stains & damages ─────────────────────────────────────────────────────
+    # Tighter boundary: stop at next ## OR next "Section N" label
+    stains_m = re.search(
+        r"## Stains & damages\s*\n(.+?)(?=\n##|\nSection\s+\d+\s*\n|\Z)",
         text, re.DOTALL | re.IGNORECASE,
     )
-    if section_m:
-        table = section_m.group(1)
-        for row in re.finditer(
-            r"^\|\s*(.+?)\s*\|\s*(?:(\d+)d|—|-)\s*\|\s*AED\s+([\d.]+)\s*\|",
-            table, re.MULTILINE,
-        ):
-            cell      = row.group(1)
-            tat_str   = row.group(2)
-            price     = float(row.group(3))
-            cell_lc   = cell.strip().lower().replace("*", "")
-
-            if cell_lc == "service":
-                continue   # header
-            if cell_lc.startswith("---"):
-                continue   # markdown separator
-            if cell_lc.startswith("total"):
-                data["total_price"] = price
-                if tat_str:
-                    data["total_tat"] = int(tat_str)
-                continue
-
-            photo_m   = re.search(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", cell)
-            photo_url = photo_m.group(1) if photo_m else None
-
-            svc_name = extract_service_name(cell)
-            removed  = "removed by customer" in cell.lower()
-
-            if svc_name:
-                data["approved_services"].append({
-                    "name":      svc_name,
-                    "tat_days":  int(tat_str) if tat_str else None,
-                    "price":     price,
-                    "photo_url": photo_url,
-                    "removed":   removed,
-                })
-
-    # Stains & damages
-    stains_m = re.search(r"## Stains & damages\s*\n(.+?)(?=\n##|\Z)", text, re.DOTALL | re.IGNORECASE)
     if stains_m:
         block = stains_m.group(1).strip()
         if block and "no stains or damages" not in block.lower():
-            data["stains_photos"] = re.findall(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", block)
-            text_only = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", block)
-            text_only = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text_only)
-            text_only = re.sub(r"\n{3,}", "\n\n", text_only).strip()
-            if text_only:
-                data["stains_text"] = text_only
+            data["stains_photos"]  = re.findall(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", block)
+            data["stains_entries"] = _clean_entries(block)
 
-    # Internal notes
-    notes_m = re.search(r"## Internal notes\s*\n(.+?)(?=\n##|\Z)", text, re.DOTALL | re.IGNORECASE)
+    # ── Internal notes ───────────────────────────────────────────────────────
+    notes_m = re.search(
+        r"## Internal notes\s*\n(.+?)(?=\n##|\nSection\s+\d+\s*\n|\Z)",
+        text, re.DOTALL | re.IGNORECASE,
+    )
     if notes_m:
         block = notes_m.group(1).strip()
         if block and "no internal notes" not in block.lower():
-            data["internal_notes"] = block
+            data["internal_entries"] = _clean_entries(block)
 
     return data
 
@@ -293,69 +350,89 @@ def process_task(task_id: str) -> None:
     raw  = scrape_page(link)
     data = parse_page(raw)
 
-    print(f"  Approver:    {data['approver_name']} ({data['approver_type']}) at {data['approver_time']}")
-    print(f"  Services:    {len(data['approved_services'])}")
-    for svc in data["approved_services"]:
-        flag = " (REMOVED)" if svc["removed"] else ""
-        photo = " [PHOTO]" if svc["photo_url"] else ""
-        print(f"    - {svc['name']} · {svc['tat_days']}d · AED {svc['price']}{flag}{photo}")
-    print(f"  Total:       AED {data['total_price']} · {data['total_tat']}d")
-    print(f"  Stains:      text={'yes' if data['stains_text'] else 'no'}, photos={len(data['stains_photos'])}")
-    print(f"  Internal:    {'yes' if data['internal_notes'] else 'no'}")
+    if data["is_rejected"]:
+        print(f"  Status:      REJECTED by {data['rejector_name']} at {data['rejected_at']}")
+        print(f"  Reason:      {data['rejection_reason']}")
+    else:
+        print(f"  Approver:    {data['approver_name']} ({data['approver_type']}) at {data['approver_time']}")
+        print(f"  Services:    {len(data['approved_services'])}")
+        for svc in data["approved_services"]:
+            flag  = " (REMOVED)" if svc["removed"] else ""
+            photo = " [PHOTO]" if svc["photo_url"] else ""
+            print(f"    - {svc['name']} · {svc['tat_days']}d · AED {svc['price']}{flag}{photo}")
+        print(f"  Total:       AED {data['total_price']} · {data['total_tat']}d")
+    print(f"  Stains:      entries={len(data['stains_entries'])}, photos={len(data['stains_photos'])}")
+    print(f"  Internal:    entries={len(data['internal_entries'])}")
 
     # 4. Deduplication
-    # Primary signal: description already contains "Approved by customer" — this
-    # is robust because the line stays in the description even if subtasks get
-    # deleted. Secondary signal: any existing subtask name matches an approved
-    # service (catches edge cases where the marker was removed manually).
+    # Skip if description already contains a status marker we'd add — protects
+    # against duplicate processing if subtasks are deleted manually.
+    if "Approved by customer" in notes or "Rejected by customer" in notes:
+        print("Already processed (description has status marker). Skipping.")
+        return
+
     approved_active = [s for s in data["approved_services"] if not s["removed"]]
     approved_names_lc = {s["name"].lower() for s in approved_active}
 
-    if "Approved by customer" in notes:
-        print("Already processed (description has 'Approved by customer'). Skipping.")
-        return
+    if approved_names_lc:
+        existing_subtasks = list_subtasks(task_id)
+        existing_names_lc = {(s.get("name") or "").strip().lower() for s in existing_subtasks}
+        overlap = existing_names_lc & approved_names_lc
+        if overlap:
+            print(f"Already processed (subtask match: {overlap}). Skipping.")
+            return
 
-    existing_subtasks = list_subtasks(task_id)
-    existing_names_lc = {(s.get("name") or "").strip().lower() for s in existing_subtasks}
-    overlap = existing_names_lc & approved_names_lc
-    if overlap:
-        print(f"Already processed (subtask match: {overlap}). Skipping.")
-        return
+    # 5. Build new description (different shape for rejected vs approved)
+    addition_lines: list[str] = []
+    if data["is_rejected"]:
+        addition_lines.append("Rejected by customer")
+        if data["rejection_reason"]:
+            addition_lines.append(f"Reason: {data['rejection_reason']}")
+        if data["rejector_name"] and data["rejected_at"]:
+            addition_lines.append(f"Rejected by {data['rejector_name']} · {data['rejected_at']}")
+    else:
+        addition_lines.append("Approved by customer")   # literal, per spec
+        if data["approver_name"] and data["approver_time"]:
+            addition_lines.append(f"Approved by {data['approver_name']} · {data['approver_time']}")
 
-    # 5. Build new description: append approval lines + internal notes
-    addition_lines = ["Approved by customer"]   # literal, per spec
-    if data["approver_name"] and data["approver_time"]:
-        addition_lines.append(f"Approved by {data['approver_name']} · {data['approver_time']}")
     new_notes = notes.rstrip() + "\n" + "\n".join(addition_lines)
-    if data["internal_notes"]:
-        new_notes += "\n\nInternal notes:\n" + data["internal_notes"]
 
-    # 6. Build the single PUT payload (description + custom fields + due date)
+    if data["internal_entries"]:
+        new_notes += "\n\nInternal notes:\n" + "\n".join(
+            f"- {e}" for e in data["internal_entries"]
+        )
+
+    # 6. Build the PUT payload
+    # Rejected orders don't get price/due-date — there's no agreed work to do.
     task_update: dict = {"notes": new_notes}
 
-    if data["total_price"] is not None:
-        task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
+    if not data["is_rejected"]:
+        if data["total_price"] is not None:
+            task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
 
-    if data["total_tat"]:
-        due_date = (date.today() + timedelta(days=data["total_tat"])).strftime("%Y-%m-%d")
-        task_update["due_on"] = due_date
-        print(f"  Due date:    {due_date} (today + {data['total_tat']} days)")
+        if data["total_tat"]:
+            due_date = (date.today() + timedelta(days=data["total_tat"])).strftime("%Y-%m-%d")
+            task_update["due_on"] = due_date
+            print(f"  Due date:    {due_date} (today + {data['total_tat']} days)")
 
-    print("Updating task (description, price, due date)...")
+    print("Updating task (description"
+          + (", price, due date" if not data["is_rejected"] else "")
+          + ")...")
     update_task(task_id, task_update)
 
-    # 7. Stains & damages comment
-    # Asana comment HTML allows: <body>, <strong>, <em>, <u>, <s>, <code>, <ol>,
-    # <ul>, <li>, <a>, <blockquote>, <pre>. <p> is NOT allowed — using <blockquote>.
-    # All user-provided text is escaped so embedded < > & don't break parsing.
-    if data["stains_text"] or data["stains_photos"]:
+    # 7. Stains & Damages comment
+    # Asana allowed elements: <body>, <strong>, <em>, <u>, <s>, <code>, <ol>,
+    # <ul>, <li>, <a>, <blockquote>, <pre>. <p> is not allowed.
+    if data["stains_entries"] or data["stains_photos"]:
         print("Adding 'Stains & Damages' comment...")
         html_parts = ["<body><strong>Stains &amp; Damages</strong>"]
-        if data["stains_text"]:
-            text_safe = _html.escape(data["stains_text"])
-            html_parts.append(f"<blockquote>{text_safe}</blockquote>")
-        if data["stains_photos"]:
+        if data["stains_entries"]:
             html_parts.append("<ul>")
+            for entry in data["stains_entries"]:
+                html_parts.append(f"<li>{_html.escape(entry)}</li>")
+            html_parts.append("</ul>")
+        if data["stains_photos"]:
+            html_parts.append("<strong>Photos:</strong><ul>")
             for i, url in enumerate(data["stains_photos"], 1):
                 url_safe = _html.escape(url, quote=True)
                 html_parts.append(f'<li><a href="{url_safe}">Photo {i}</a></li>')
@@ -363,23 +440,23 @@ def process_task(task_id: str) -> None:
         html_parts.append("</body>")
         add_comment(task_id, "".join(html_parts))
 
-    # 8. Per-service photo comments (one comment per service that has a photo)
-    for svc in approved_active:
-        if svc.get("photo_url"):
-            print(f"Adding photo comment for: {svc['name']}")
-            name_safe = _html.escape(svc["name"])
-            url_safe  = _html.escape(svc["photo_url"], quote=True)
-            html = (
-                f"<body><strong>{name_safe}</strong>"
-                f"<ul><li><a href=\"{url_safe}\">View photo</a></li></ul>"
-                f"</body>"
-            )
-            add_comment(task_id, html)
+    # 8. Per-service photo comments + subtasks (only for approved orders)
+    if not data["is_rejected"]:
+        for svc in approved_active:
+            if svc.get("photo_url"):
+                print(f"Adding photo comment for: {svc['name']}")
+                name_safe = _html.escape(svc["name"])
+                url_safe  = _html.escape(svc["photo_url"], quote=True)
+                html = (
+                    f"<body><strong>{name_safe}</strong>"
+                    f"<ul><li><a href=\"{url_safe}\">View photo</a></li></ul>"
+                    f"</body>"
+                )
+                add_comment(task_id, html)
 
-    # 9. Subtasks — one per approved service (excluding removed)
-    for svc in approved_active:
-        print(f"Creating subtask: {svc['name']}")
-        create_subtask(task_id, svc["name"])
+        for svc in approved_active:
+            print(f"Creating subtask: {svc['name']}")
+            create_subtask(task_id, svc["name"])
 
     print("\nDone!")
 
