@@ -2,20 +2,30 @@
 """
 Asana webhook server for the Service Wizard automation.
 
-Listens for Asana task:changed events. When an agent pastes a
-Service Wizard link into a task description, this server detects
-it and runs the full automation (photos, comment, custom fields,
-subtask, due date) automatically.
+Listens for Asana task:changed events on the `notes` field. When the
+asana-shooter worker (or anyone) appends a Service Wizard "Customer approval
+response" link to a task description, this server detects it and runs the
+full automation:
+
+  - subtasks per approved service
+  - "Approved by customer" + approver line appended to description
+  - internal notes appended to description (when present)
+  - Stains & Damages comment (when present)
+  - per-service photo comments (when present)
+  - Price custom field set to total
+  - due date set to today + total TAT days
+
+Deduplication is handled inside process_task() — it skips if any existing
+subtask name matches an approved service name on the page.
 """
 
 import os
 import threading
 import logging
-import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-from process_task import process_task, extract_service_wizard_link, get_task
+from process_task import process_task, find_link, get_task
 
 load_dotenv()
 
@@ -27,54 +37,22 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-ASANA_BASE = "https://app.asana.com/api/1.0"
-
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Background worker
 # ---------------------------------------------------------------------------
-
-def _asana_headers() -> dict:
-    return {"Authorization": f"Bearer {os.getenv('ASANA_PAT')}"}
-
-
-def is_already_processed(task_id: str) -> bool:
-    """Return True if our automation has already run on this task.
-
-    We detect this by checking whether the task already has a 'before.jpg'
-    attachment — the first thing the automation uploads.
-    """
-    try:
-        r = requests.get(
-            f"{ASANA_BASE}/tasks/{task_id}/attachments",
-            headers=_asana_headers(),
-            timeout=10,
-        )
-        r.raise_for_status()
-        names = {a.get("name") for a in r.json().get("data", [])}
-        return "before.jpg" in names
-    except Exception as exc:
-        log.warning("Could not check attachments for task %s: %s", task_id, exc)
-        return False
-
 
 def handle_task_change(task_id: str) -> None:
-    """Background worker: run automation if conditions are met."""
+    """Run automation if a Service Wizard link is in the description.
+    process_task() handles its own dedup (existing-subtask check)."""
     try:
         log.info("Checking task %s …", task_id)
 
         task = get_task(task_id)
-        notes = task.get("notes", "")
+        notes = task.get("notes", "") or ""
 
-        # 1. Does the description contain a Service Wizard link?
-        link = extract_service_wizard_link(notes)
-        if not link:
-            log.info("Task %s — no Service Wizard link, skipping.", task_id)
-            return
-
-        # 2. Have we already processed this task?
-        if is_already_processed(task_id):
-            log.info("Task %s — already processed, skipping.", task_id)
+        if not find_link(notes):
+            log.info("Task %s — no Service Wizard link in description.", task_id)
             return
 
         log.info("Task %s — link found, running automation …", task_id)
@@ -92,7 +70,7 @@ def handle_task_change(task_id: str) -> None:
 @app.route("/webhook", methods=["POST"])
 def webhook():
     # ── Asana handshake ──────────────────────────────────────────────────────
-    # On first registration Asana sends X-Hook-Secret and expects it echoed back
+    # On first registration Asana sends X-Hook-Secret and expects it echoed back.
     hook_secret = request.headers.get("X-Hook-Secret")
     if hook_secret:
         log.info("Asana webhook handshake — responding with secret.")
@@ -100,8 +78,9 @@ def webhook():
 
     # ── Event processing ─────────────────────────────────────────────────────
     payload = request.get_json(silent=True) or {}
-    events = payload.get("events", [])
+    events  = payload.get("events", [])
 
+    queued = set()
     for event in events:
         resource = event.get("resource", {})
         change   = event.get("change", {})
@@ -112,7 +91,8 @@ def webhook():
             and change.get("field") == "notes"
         ):
             task_id = resource.get("gid")
-            if task_id:
+            if task_id and task_id not in queued:
+                queued.add(task_id)
                 log.info("Notes updated on task %s — queuing …", task_id)
                 threading.Thread(
                     target=handle_task_change,
@@ -120,17 +100,17 @@ def webhook():
                     daemon=True,
                 ).start()
 
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "queued": len(queued)}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Railway uses this to verify the service is up."""
+    """Render and other PaaS hosts hit this to verify the service is up."""
     return jsonify({"status": "healthy"}), 200
 
 
 # ---------------------------------------------------------------------------
-# Entry point (local dev only — Railway uses gunicorn via Procfile)
+# Local dev entry — production uses gunicorn via Procfile / startCommand
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
