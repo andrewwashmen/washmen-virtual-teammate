@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Washmen Service Wizard → Asana Automation
+Washmen Service Wizard → Asana Automation (v2)
 
-For a given Asana task:
-  1. Finds the Service Wizard link under "Customer response:" in the description
-  2. Scrapes the page (handles React SPA via Jina AI Reader)
-  3. Uploads all assessment photos as real Asana task attachments
-  4. Adds a pinned summary comment with all text data
-  5. Creates a subtask for each approved service
+When a Service Wizard "Customer approval response" link is in a task's
+description, this script reads the Final Approved Scope from the page and
+updates the Asana task:
+
+- Subtasks: one per approved service name (excludes "Removed by customer")
+- Description: appends "Approved by customer" + "Approved by <Name> · <time>"
+- Internal notes (if present): appended to description bottom
+- Stains & damages (if present): comment with text + photos labeled "Stains & Damages"
+- Service photos (if present under Final approved scope): one comment per service
+- Price custom field: total approved price
+- Due date: today + total TAT days
+- Deduplication: skips if task already has a subtask matching any approved service
 """
 
 import os
@@ -15,77 +21,76 @@ import re
 import sys
 import json
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, date
 from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
-ASANA_PAT = os.getenv("ASANA_PAT")
+ASANA_PAT  = os.getenv("ASANA_PAT")
 ASANA_BASE = "https://app.asana.com/api/1.0"
-JINA_BASE = "https://r.jina.ai"
+JINA_BASE  = "https://r.jina.ai"
+
+# Custom field GID
+PRICE_FIELD_GID = "1202480206903933"
+
+# Both the Lovable preview domain and the Washmen production domain are supported
+LINK_PATTERNS = [
+    r"https://service-wizard-kit\.lovable\.app/approved/[a-f0-9\-]+",
+    r"https://sc\.washmen\.com/approved/[a-f0-9\-]+",
+]
 
 
 # ---------------------------------------------------------------------------
 # Asana API helpers
 # ---------------------------------------------------------------------------
 
-def _asana_headers() -> dict:
+def _headers() -> dict:
     if not ASANA_PAT:
         raise RuntimeError("ASANA_PAT is not set. Add it to your .env file.")
     return {"Authorization": f"Bearer {ASANA_PAT}"}
 
 
 def get_task(task_id: str) -> dict:
-    r = requests.get(f"{ASANA_BASE}/tasks/{task_id}", headers=_asana_headers(), timeout=15)
+    r = requests.get(f"{ASANA_BASE}/tasks/{task_id}", headers=_headers(), timeout=15)
     r.raise_for_status()
     return r.json()["data"]
 
 
-def upload_attachment(task_id: str, image_url: str, filename: str) -> dict:
-    """Download an image and upload it as a native Asana task attachment."""
-    img = requests.get(image_url, timeout=30)
-    img.raise_for_status()
-    content_type = img.headers.get("Content-Type", "image/jpeg")
-
-    r = requests.post(
-        f"{ASANA_BASE}/attachments",
-        headers=_asana_headers(),
-        files={"file": (filename, img.content, content_type)},
-        data={"parent": task_id},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["data"]
-
-
-def add_pinned_comment(task_id: str, html: str) -> dict:
-    r = requests.post(
-        f"{ASANA_BASE}/tasks/{task_id}/stories",
-        headers={**_asana_headers(), "Content-Type": "application/json"},
-        json={"data": {"html_text": html, "is_pinned": True}},
-        timeout=15,
+def list_subtasks(task_id: str) -> list:
+    r = requests.get(
+        f"{ASANA_BASE}/tasks/{task_id}/subtasks",
+        headers=_headers(), params={"opt_fields": "name"}, timeout=15,
     )
     r.raise_for_status()
     return r.json()["data"]
 
 
 def update_task(task_id: str, payload: dict) -> dict:
-    """PUT a task — used for due date, custom fields, etc."""
     r = requests.put(
         f"{ASANA_BASE}/tasks/{task_id}",
-        headers={**_asana_headers(), "Content-Type": "application/json"},
-        json={"data": payload},
+        headers={**_headers(), "Content-Type": "application/json"},
+        json={"data": payload}, timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def add_comment(task_id: str, html: str, pinned: bool = False) -> dict:
+    r = requests.post(
+        f"{ASANA_BASE}/tasks/{task_id}/stories",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json={"data": {"html_text": html, "is_pinned": pinned}},
         timeout=15,
     )
     r.raise_for_status()
     return r.json()["data"]
 
 
-def create_subtask(task_id: str, name: str, notes: str) -> dict:
+def create_subtask(task_id: str, name: str, notes: str = "") -> dict:
     r = requests.post(
         f"{ASANA_BASE}/tasks",
-        headers={**_asana_headers(), "Content-Type": "application/json"},
+        headers={**_headers(), "Content-Type": "application/json"},
         json={"data": {"name": name, "notes": notes, "parent": task_id}},
         timeout=15,
     )
@@ -97,215 +102,264 @@ def create_subtask(task_id: str, name: str, notes: str) -> dict:
 # Scraping & parsing
 # ---------------------------------------------------------------------------
 
-def extract_service_wizard_link(notes: str) -> Optional[str]:
-    """Pull the lovable.app URL out of the task description."""
-    match = re.search(
-        r"https://service-wizard-kit\.lovable\.app/approved/[a-f0-9\-]+",
-        notes,
-    )
-    return match.group(0) if match else None
+def find_link(notes: str) -> Optional[str]:
+    for pattern in LINK_PATTERNS:
+        m = re.search(pattern, notes)
+        if m:
+            return m.group(0)
+    return None
 
 
 def scrape_page(url: str) -> str:
-    """Render the React SPA via Jina AI Reader and return markdown text."""
-    r = requests.get(f"{JINA_BASE}/{url}", timeout=45)
+    """Render the React SPA via Jina AI Reader (markdown mode, cache-bypassed)."""
+    r = requests.get(
+        f"{JINA_BASE}/{url}",
+        headers={"X-No-Cache": "true", "X-Timeout": "60"},
+        timeout=120,
+    )
     r.raise_for_status()
     return r.text
 
 
-def _find(pattern: str, text: str, flags: int = re.IGNORECASE) -> Optional[str]:
-    m = re.search(pattern, text, flags)
-    return m.group(1).strip() if m else None
+def extract_service_name(cell_text: str) -> str:
+    """Extract the clean service name from a Final Approved Scope cell.
 
+    Cells render as `<Name> <Description>` in markdown — the visual line break
+    between them is collapsed. Algorithm: walk forward through TitleCase words;
+    the description starts at the first TitleCase word that's followed by a
+    lowercase word. The service name is everything before that.
 
-def parse_assessment(text: str) -> dict:
-    """Parse Jina-rendered markdown into structured assessment data.
-
-    The Service Wizard page renders as plain markdown with sections like:
-      ## Sorter captured        → Brand, Type, Color, Sorted at
-      ## Approved services ...  → Markdown table with service rows
-      ## Order summary          → Order code, Customer
+    Examples:
+        "Premium Cleaning Some stains might..."  → "Premium Cleaning"
+        "Icing Removed by customer"              → "Icing"
+        "Sanitize & Deodorize A deep treatment"  → "Sanitize & Deodorize"
+        "Leather Insole Replacement Fit and..."  → "Leather Insole Replacement"
     """
-    # Isolate the "## Sorter captured" section for reliable item details
-    sorter_m = re.search(r"## Sorter captured(.+?)(?=##|$)", text, re.DOTALL | re.IGNORECASE)
-    sorter = sorter_m.group(1) if sorter_m else ""
+    cell = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", cell_text)        # strip ![alt](url)
+    cell = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cell)          # collapse [txt](url)
+    cell = re.sub(r"\*+", "", cell).strip()
 
+    words = cell.split()
+    if not words:
+        return ""
+
+    name_parts: list[str] = []
+    for i, word in enumerate(words):
+        plain = word.rstrip(".,;:").strip()
+        if not plain:
+            continue
+
+        if plain == "&":                # part of names like "Sanitize & Deodorize"
+            name_parts.append(word)
+            continue
+
+        first = plain[0]
+        if first.islower():             # current word is lowercase → description started before it
+            break
+
+        # Current word is TitleCase. Check if it's the boundary (TC followed by lowercase):
+        # if so, this word is the FIRST word of the description, not part of the name.
+        if i + 1 < len(words):
+            next_plain = words[i + 1].rstrip(".,;:").strip()
+            if next_plain and next_plain[0].islower():
+                break   # do NOT append — current word is description start
+
+        name_parts.append(word)
+
+    return " ".join(name_parts).strip()
+
+
+def parse_page(text: str) -> dict:
+    """Parse the rendered Service Wizard markdown into structured data."""
     data: dict = {
-        # From the inline header summary line:  Order `ORD-1966` · Customer **Rami Shaar**
-        "order_code": _find(r"Order\s+`([^`]+)`", text),
-        "customer":   (
-            _find(r"Customer\s+\*\*([^*]+)\*\*", text)          # bold inline form
-            or _find(r"^Customer\s+([^\n]+)", text, re.MULTILINE)  # plain section form
-        ),
-        # From "## Sorter captured" — most reliable, already validated by sorter
-        "brand":      _find(r"^Brand\s+([^\n]+)", sorter, re.MULTILINE | re.IGNORECASE),
-        "item_type":  _find(r"^Type\s+([^\n]+)",  sorter, re.MULTILINE | re.IGNORECASE),
-        "color":      _find(r"^Color\s+([^\n]+)", sorter, re.MULTILINE | re.IGNORECASE),
-        "sorted_at":  _find(r"Sorted at\s+([^\n]+)", sorter, re.IGNORECASE),
-        "status":     "Approved by facility" if "Approved by facility" in text else None,
-        # Populated below from the approved services table
-        "services":   [],
-        "service":    None,   # first service name (convenience)
-        "price":      None,   # first service price (convenience)
-        "turnaround": None,   # first service TAT (convenience)
-        "photo_urls": [],
+        "approver_name":     None,
+        "approver_time":     None,
+        "approver_type":     None,   # "Customer" or "Facility"
+        "approved_services": [],     # [{name, tat_days, price, photo_url, removed}]
+        "total_tat":         None,
+        "total_price":       None,
+        "stains_text":       None,
+        "stains_photos":     [],
+        "internal_notes":    None,
     }
 
-    # ── Approved services table ──────────────────────────────────────────────
-    # Section heading: "## Approved services (operator scope)"
-    # Row format: | **Premium Cleaning** | AED 145 | 3 (committed: 3) | — |
-    approved_m = re.search(
-        r"## Approved services.*?\n(.+?)(?=##|$)",
+    # Approver type: "Final approved scope(v1 · Customer)" or "(v2 · Facility)"
+    m = re.search(
+        r"Final approved scope\s*\(\s*v?\d*\s*·\s*(Customer|Facility)\s*\)",
+        text, re.IGNORECASE,
+    )
+    if m:
+        data["approver_type"] = m.group(1)
+
+    # Approver line: "Approved by Haris Velijevic · 01 May, 10:50"
+    m = re.search(r"Approved by\s+([^·\n]+?)\s*·\s*([^\n]+)", text)
+    if m:
+        data["approver_name"] = m.group(1).strip()
+        data["approver_time"] = m.group(2).strip()
+
+    # Final Approved Scope table — isolate the section
+    section_m = re.search(
+        r"Final approved scope.*?\n(.+?)(?=\nApproved by|\nQuote history|\n##|\Z)",
         text, re.DOTALL | re.IGNORECASE,
     )
-    if approved_m:
+    if section_m:
+        table = section_m.group(1)
         for row in re.finditer(
-            r"\|\s+\*\*(?!Total)([^*|]+)\*\*\s+\|\s+AED\s+([\d.]+)\s+\|\s+(\d+)[^|]*\|",
-            approved_m.group(1),
+            r"^\|\s*(.+?)\s*\|\s*(?:(\d+)d|—|-)\s*\|\s*AED\s+([\d.]+)\s*\|",
+            table, re.MULTILINE,
         ):
-            svc_name = row.group(1).strip()
-            svc_price = float(row.group(2))
-            tat_days = row.group(3).strip()
-            data["services"].append({
-                "name":       svc_name,
-                "price":      svc_price,
-                "turnaround": f"{tat_days} days",
-            })
+            cell      = row.group(1)
+            tat_str   = row.group(2)
+            price     = float(row.group(3))
+            cell_lc   = cell.strip().lower().replace("*", "")
 
-    if data["services"]:
-        data["service"]    = data["services"][0]["name"]
-        data["price"]      = data["services"][0]["price"]
-        data["turnaround"] = data["services"][0]["turnaround"]
+            if cell_lc == "service":
+                continue   # header
+            if cell_lc.startswith("---"):
+                continue   # markdown separator
+            if cell_lc.startswith("total"):
+                data["total_price"] = price
+                if tat_str:
+                    data["total_tat"] = int(tat_str)
+                continue
 
-    # ── Photos ───────────────────────────────────────────────────────────────
-    all_urls = re.findall(
-        r"https://[a-z0-9]+\.supabase\.co/storage/v1/object/public/[^\s)\]\"']+",
-        text,
-    )
-    data["photo_urls"] = list(dict.fromkeys(all_urls))  # deduplicate, preserve order
+            photo_m   = re.search(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", cell)
+            photo_url = photo_m.group(1) if photo_m else None
+
+            svc_name = extract_service_name(cell)
+            removed  = "removed by customer" in cell.lower()
+
+            if svc_name:
+                data["approved_services"].append({
+                    "name":      svc_name,
+                    "tat_days":  int(tat_str) if tat_str else None,
+                    "price":     price,
+                    "photo_url": photo_url,
+                    "removed":   removed,
+                })
+
+    # Stains & damages
+    stains_m = re.search(r"## Stains & damages\s*\n(.+?)(?=\n##|\Z)", text, re.DOTALL | re.IGNORECASE)
+    if stains_m:
+        block = stains_m.group(1).strip()
+        if block and "no stains or damages" not in block.lower():
+            data["stains_photos"] = re.findall(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", block)
+            text_only = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", block)
+            text_only = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text_only)
+            text_only = re.sub(r"\n{3,}", "\n\n", text_only).strip()
+            if text_only:
+                data["stains_text"] = text_only
+
+    # Internal notes
+    notes_m = re.search(r"## Internal notes\s*\n(.+?)(?=\n##|\Z)", text, re.DOTALL | re.IGNORECASE)
+    if notes_m:
+        block = notes_m.group(1).strip()
+        if block and "no internal notes" not in block.lower():
+            data["internal_notes"] = block
 
     return data
-
-
-def photo_filename(url: str, index: int) -> str:
-    """Generate a human-readable filename from the URL path."""
-    if "/before/" in url:
-        return "before.jpg"
-    ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-    return f"sorting_{index}.{ext}"
 
 
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
 
-def process_task(task_id: str):
+def process_task(task_id: str) -> None:
     print(f"\n{'='*60}")
     print(f"Processing task: {task_id}")
     print(f"{'='*60}")
 
     # 1. Fetch task
-    task = get_task(task_id)
+    task  = get_task(task_id)
+    notes = task.get("notes", "") or ""
     print(f"Task: {task['name']}")
 
-    notes = task.get("notes", "")
-
-    # 2. Find Service Wizard link
-    link = extract_service_wizard_link(notes)
+    # 2. Find link
+    link = find_link(notes)
     if not link:
-        print("No Service Wizard link found under 'Customer response:'. Skipping.")
+        print("No Service Wizard link found in description. Skipping.")
+        return
+    print(f"Link: {link}")
+
+    # 3. Scrape & parse
+    print("Scraping page via Jina AI Reader...")
+    raw  = scrape_page(link)
+    data = parse_page(raw)
+
+    print(f"  Approver:    {data['approver_name']} ({data['approver_type']}) at {data['approver_time']}")
+    print(f"  Services:    {len(data['approved_services'])}")
+    for svc in data["approved_services"]:
+        flag = " (REMOVED)" if svc["removed"] else ""
+        photo = " [PHOTO]" if svc["photo_url"] else ""
+        print(f"    - {svc['name']} · {svc['tat_days']}d · AED {svc['price']}{flag}{photo}")
+    print(f"  Total:       AED {data['total_price']} · {data['total_tat']}d")
+    print(f"  Stains:      text={'yes' if data['stains_text'] else 'no'}, photos={len(data['stains_photos'])}")
+    print(f"  Internal:    {'yes' if data['internal_notes'] else 'no'}")
+
+    # 4. Deduplication: skip if any existing subtask name matches an approved service
+    approved_active = [s for s in data["approved_services"] if not s["removed"]]
+    approved_names_lc = {s["name"].lower() for s in approved_active}
+
+    existing_subtasks = list_subtasks(task_id)
+    existing_names_lc = {(s.get("name") or "").strip().lower() for s in existing_subtasks}
+    overlap = existing_names_lc & approved_names_lc
+    if overlap:
+        print(f"Already processed (subtask match: {overlap}). Skipping.")
         return
 
-    print(f"Link found: {link}")
+    # 5. Build new description: append approval lines + internal notes
+    addition_lines = ["Approved by customer"]   # literal, per spec
+    if data["approver_name"] and data["approver_time"]:
+        addition_lines.append(f"Approved by {data['approver_name']} · {data['approver_time']}")
+    new_notes = notes.rstrip() + "\n" + "\n".join(addition_lines)
+    if data["internal_notes"]:
+        new_notes += "\n\nInternal notes:\n" + data["internal_notes"]
 
-    # 3. Scrape
-    print("Scraping page via Jina AI Reader...")
-    raw = scrape_page(link)
+    # 6. Build the single PUT payload (description + custom fields + due date)
+    task_update: dict = {"notes": new_notes}
 
-    # 4. Parse
-    data = parse_assessment(raw)
-    print(f"Parsed: {json.dumps({k: v for k, v in data.items() if k != 'photo_urls'}, indent=2)}")
-    print(f"Photos found: {len(data['photo_urls'])}")
+    if data["total_price"] is not None:
+        task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
 
-    # 5. Upload photos as real Asana attachments
-    sorting_index = 1
-    for url in data["photo_urls"]:
-        filename = photo_filename(url, sorting_index)
-        if "sorting" in filename:
-            sorting_index += 1
-        print(f"  Uploading {filename} ...", end=" ", flush=True)
-        try:
-            att = upload_attachment(task_id, url, filename)
-            print(f"OK ({att.get('name')})")
-        except Exception as e:
-            print(f"FAILED: {e}")
+    if data["total_tat"]:
+        due_date = (date.today() + timedelta(days=data["total_tat"])).strftime("%Y-%m-%d")
+        task_update["due_on"] = due_date
+        print(f"  Due date:    {due_date} (today + {data['total_tat']} days)")
 
-    # 6. Pinned summary comment (text data only — photos are attachments above)
-    price_str = f"AED {data['price']:.2f}" if data["price"] else "N/A"
-    comment_html = (
-        "<body>"
-        "<strong>Assessment Summary — Service Wizard</strong>"
-        "<ul>"
-        f"<li><strong>Service:</strong> {data['service'] or 'N/A'}</li>"
-        f"<li><strong>Price:</strong> {price_str}</li>"
-        f"<li><strong>Turnaround:</strong> {data['turnaround'] or 'N/A'}</li>"
-        f"<li><strong>Brand:</strong> {data['brand'] or 'N/A'}</li>"
-        f"<li><strong>Item Type:</strong> {data['item_type'] or 'N/A'}</li>"
-        f"<li><strong>Color:</strong> {data['color'] or 'N/A'}</li>"
-        f"<li><strong>Order Code:</strong> {data['order_code'] or 'N/A'}</li>"
-        f"<li><strong>Customer:</strong> {data['customer'] or 'N/A'}</li>"
-        f"<li><strong>Status:</strong> {data['status'] or 'N/A'}"
-        f"{' — ' + data['sorted_at'] if data['sorted_at'] else ''}</li>"
-        "</ul>"
-        f"<em>{len(data['photo_urls'])} assessment photos uploaded as attachments.</em>"
-        "</body>"
-    )
-    print("Adding pinned summary comment...")
-    add_pinned_comment(task_id, comment_html)
+    print("Updating task (description, price, due date)...")
+    update_task(task_id, task_update)
 
-    # 7. Update custom fields + due date
-    custom_fields = {}
-    if data["price"] is not None:
-        custom_fields["1202480206903933"] = data["price"]        # Price (number)
-    if data["color"]:
-        custom_fields["1202289965454672"] = data["color"]        # Colour (text)
-    if data["brand"]:
-        custom_fields["1202289964354114"] = data["brand"]        # Brand (text)
+    # 7. Stains & damages comment
+    if data["stains_text"] or data["stains_photos"]:
+        print("Adding 'Stains & Damages' comment...")
+        html_parts = ["<body><strong>Stains &amp; Damages</strong>"]
+        if data["stains_text"]:
+            for para in data["stains_text"].split("\n\n"):
+                if para.strip():
+                    html_parts.append(f"<p>{para.strip()}</p>")
+        if data["stains_photos"]:
+            html_parts.append("<ul>")
+            for url in data["stains_photos"]:
+                html_parts.append(f'<li><a href="{url}">Photo</a></li>')
+            html_parts.append("</ul>")
+        html_parts.append("</body>")
+        add_comment(task_id, "".join(html_parts))
 
-    task_update: dict = {}
-    if custom_fields:
-        task_update["custom_fields"] = custom_fields
+    # 8. Per-service photo comments (one comment per service that has a photo)
+    for svc in approved_active:
+        if svc.get("photo_url"):
+            print(f"Adding photo comment for: {svc['name']}")
+            html = (
+                f"<body><strong>{svc['name']}</strong>"
+                f'<p><a href="{svc["photo_url"]}">View photo</a></p>'
+                f"</body>"
+            )
+            add_comment(task_id, html)
 
-    # Due date = task created_at + turnaround days
-    tat_match = re.match(r"(\d+)", data["turnaround"] or "")
-    if tat_match:
-        tat_days = int(tat_match.group(1))
-        created_at = task.get("created_at", "")
-        if created_at:
-            created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            due_date = (created_dt + timedelta(days=tat_days)).strftime("%Y-%m-%d")
-            task_update["due_on"] = due_date
-            print(f"Due date: {due_date} (created {created_dt.date()} + {tat_days} days)")
-
-    if task_update:
-        print(f"Updating task fields: {list(task_update.keys())}")
-        update_task(task_id, task_update)
-
-    # 8. One subtask per approved service
-    for svc in data["services"]:
-        svc_price_str = f"AED {svc['price']:.2f}"
-        subtask_name = f"{svc['name']} — {svc_price_str} | TAT: {svc['turnaround']}"
-        subtask_notes = (
-            f"Approved service from Service Wizard assessment.\n\n"
-            f"Service: {svc['name']}\n"
-            f"Price: {svc_price_str}\n"
-            f"Turnaround: {svc['turnaround']}\n"
-            f"Approved by facility: {data['sorted_at'] or 'N/A'}\n"
-            f"Source: {link}"
-        )
-        print(f"Creating subtask: {subtask_name}")
-        sub = create_subtask(task_id, subtask_name, subtask_notes)
-        print(f"  Subtask created: {sub['gid']}")
+    # 9. Subtasks — one per approved service (excluding removed)
+    for svc in approved_active:
+        print(f"Creating subtask: {svc['name']}")
+        create_subtask(task_id, svc["name"])
 
     print("\nDone!")
 
@@ -313,7 +367,5 @@ def process_task(task_id: str):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python process_task.py <task_id>")
-        print("Example: python process_task.py 1214378804036117")
         sys.exit(1)
-
     process_task(sys.argv[1])
