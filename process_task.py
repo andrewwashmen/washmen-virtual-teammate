@@ -403,10 +403,15 @@ def process_task(task_id: str) -> None:
         )
 
     # 6. Build the PUT payload
-    # Rejected orders don't get price/due-date — there's no agreed work to do.
+    # Rejected orders: clear price + due date (no agreed work to do, so any
+    # leftover values from a prior run would be misleading).
+    # Approved orders: set price + due date from the page.
     task_update: dict = {"notes": new_notes}
 
-    if not data["is_rejected"]:
+    if data["is_rejected"]:
+        task_update["custom_fields"] = {PRICE_FIELD_GID: None}
+        task_update["due_on"] = None
+    else:
         if data["total_price"] is not None:
             task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
 
@@ -416,7 +421,7 @@ def process_task(task_id: str) -> None:
             print(f"  Due date:    {due_date} (today + {data['total_tat']} days)")
 
     print("Updating task (description"
-          + (", price, due date" if not data["is_rejected"] else "")
+          + (", price, due date" if not data["is_rejected"] else ", clear price + due date")
           + ")...")
     update_task(task_id, task_update)
 
