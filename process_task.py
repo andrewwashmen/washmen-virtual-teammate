@@ -579,7 +579,7 @@ def process_task(task_id: str) -> None:
     if data["internal_entries"]:
         new_notes += "\n\nInternal notes:\n" + "\n".join(f"- {e}" for e in data["internal_entries"])
     if data["sorter_suggested"]:
-        new_notes += "\n\nSorted Suggested:\n" + ", ".join(data["sorter_suggested"]) + "."
+        new_notes += "\n\nSorter Suggested:\n" + ", ".join(data["sorter_suggested"]) + "."
 
     # Rejected orders: clear price + due date (no agreed work — leftover values
     # from prior runs would be misleading). Approved orders: set both.
