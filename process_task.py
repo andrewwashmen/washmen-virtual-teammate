@@ -368,6 +368,13 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
     approved_at    = snapshot.get("approved_at")
     source_label   = (snapshot.get("source") or "").capitalize() or None
 
+    # Sorter-suggested = operator's snapshot at send time. The SPA only
+    # populates `operator_services_at_send` when the customer mutated the
+    # scope, so when empty, the final `services` list IS the operator's
+    # recommendation (page mirrors this fallback).
+    sorter_source     = snapshot.get("operator_services_at_send") or snapshot.get("services") or []
+    sorter_suggested  = [s.get("name") for s in sorter_source if s.get("name")]
+
     return {
         "has_snapshot":      True,
         "is_rejected":       is_rejected,
@@ -383,6 +390,7 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
         "stains_entries":    [e["note"] for e in damage_entries if e["note"]],
         "stains_photos":     stains_photos,
         "damage_entries":    damage_entries,
+        "sorter_suggested":  sorter_suggested,
         "internal_entries":  internal_entries,
     }
 
@@ -570,6 +578,8 @@ def process_task(task_id: str) -> None:
     new_notes = notes.rstrip() + "\n" + "\n".join(addition_lines)
     if data["internal_entries"]:
         new_notes += "\n\nInternal notes:\n" + "\n".join(f"- {e}" for e in data["internal_entries"])
+    if data["sorter_suggested"]:
+        new_notes += "\n\nSorted Suggested:\n" + ", ".join(data["sorter_suggested"]) + "."
 
     # Rejected orders: clear price + due date (no agreed work — leftover values
     # from prior runs would be misleading). Approved orders: set both.
