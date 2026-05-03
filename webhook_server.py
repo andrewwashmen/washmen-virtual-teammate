@@ -39,12 +39,37 @@ app = Flask(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Per-task in-flight guard
+# ---------------------------------------------------------------------------
+# Asana fires a follow-up webhook when process_task writes the description
+# marker — that event would otherwise spawn a redundant thread, and if the
+# bot's first run + the follow-up overlap by milliseconds, both threads race
+# past dedup and post duplicate comments / attachments.
+#
+# Single-worker deployment means this set is authoritative for the whole
+# server (multi-worker would need Redis-backed coordination, but volume
+# doesn't justify that here).
+_IN_FLIGHT: set[str] = set()
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
 
 def handle_task_change(task_id: str) -> None:
     """Run automation if a Service Wizard link is in the description.
-    process_task() handles its own dedup (existing-subtask check)."""
+
+    Skipped (no-op) if another thread is already processing this task. The
+    running thread will see the latest task state when it next refetches, so
+    we don't lose any updates by skipping.
+    """
+    with _IN_FLIGHT_LOCK:
+        if task_id in _IN_FLIGHT:
+            log.info("Task %s — already in flight, skipping duplicate event.", task_id)
+            return
+        _IN_FLIGHT.add(task_id)
+
     try:
         log.info("Checking task %s …", task_id)
 
@@ -61,6 +86,9 @@ def handle_task_change(task_id: str) -> None:
 
     except Exception as exc:
         log.error("Error processing task %s: %s", task_id, exc, exc_info=True)
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.discard(task_id)
 
 
 # ---------------------------------------------------------------------------

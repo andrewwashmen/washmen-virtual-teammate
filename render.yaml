@@ -6,7 +6,9 @@ services:
     runtime: python
     plan: starter   # $7/month, always-on (required for reliable Asana webhooks)
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn webhook_server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    # Single worker keeps the per-task in-flight lock authoritative; multi-worker
+    # would need cross-process coordination (Redis) and the volume doesn't warrant it.
+    startCommand: gunicorn webhook_server:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     healthCheckPath: /health
     envVars:
       - key: ASANA_PAT
