@@ -8,12 +8,12 @@ response" link to a task description, this server detects it and runs the
 full automation:
 
   - subtasks per approved service
-  - "Approved by customer" + approver line appended to description
+  - "Approved by customer" / "Rejected by customer" line appended to description
   - internal notes appended to description (when present)
-  - Stains & Damages comment (when present)
-  - per-service photo comments (when present)
-  - Price custom field set to total
-  - due date set to today + total TAT days
+  - Stains & Damages comment with damage photos attached (when present)
+  - Per-service comment with that service's photos attached (when present)
+  - Price custom field set to total (cleared on rejection)
+  - due date set to today + total TAT days (cleared on rejection)
 
 Deduplication is handled inside process_task() — it skips if any existing
 subtask name matches an approved service name on the page.
