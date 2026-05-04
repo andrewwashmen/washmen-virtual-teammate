@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 import process_task as pt
+from notify import notify_error, CTX_RECON
 
 load_dotenv()
 
@@ -117,6 +118,11 @@ def main() -> None:
         except Exception as e:
             print(f"  ERROR processing {tid}: {e}")
             failures.append((tid, str(e)))
+            try:
+                task_name = pt.get_task(tid).get("name")
+            except Exception:
+                task_name = None
+            notify_error(tid, e, CTX_RECON, task_name=task_name)
 
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
     print(f"\n=== Reconciler complete in {elapsed:.1f}s: "

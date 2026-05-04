@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 
 from process_task import process_task, find_link, get_task, ASANA_BASE, _asana_headers
 from sync_task    import sync_task
+from notify       import notify_error, CTX_INITIAL, CTX_CHANGE
 
 load_dotenv()
 
@@ -72,6 +73,7 @@ def handle_task_change(task_id: str) -> None:
             return
         _IN_FLIGHT.add(task_id)
 
+    task: dict | None = None
     try:
         log.info("Checking task %s …", task_id)
 
@@ -88,6 +90,7 @@ def handle_task_change(task_id: str) -> None:
 
     except Exception as exc:
         log.error("Error processing task %s: %s", task_id, exc, exc_info=True)
+        notify_error(task_id, exc, CTX_INITIAL, task_name=(task or {}).get("name"))
     finally:
         with _IN_FLIGHT_LOCK:
             _IN_FLIGHT.discard(task_id)
@@ -134,6 +137,11 @@ def handle_story_added(task_id: str, story_id: str) -> None:
 
     except Exception as exc:
         log.error("Error syncing task %s after story event: %s", task_id, exc, exc_info=True)
+        try:
+            task_name = get_task(task_id).get("name")
+        except Exception:
+            task_name = None
+        notify_error(task_id, exc, CTX_CHANGE, task_name=task_name)
     finally:
         with _IN_FLIGHT_LOCK:
             _IN_FLIGHT.discard(task_id)

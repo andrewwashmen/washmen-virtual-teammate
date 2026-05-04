@@ -15,6 +15,8 @@ services:
         sync: false   # set manually in dashboard (secret)
       - key: ASANA_PROJECT_GID
         value: "1202289964354061"
+      - key: SLACK_WEBHOOK_URL
+        sync: false   # set manually; notifications silently no-op if unset
 
   # Reconciler: runs hourly, finds tasks with the Lovable link in notes
   # but no Approved/Rejected marker, and runs process_task on each. Pure
@@ -33,3 +35,5 @@ services:
         sync: false
       - key: ASANA_PROJECT_GID
         value: "1202289964354061"
+      - key: SLACK_WEBHOOK_URL
+        sync: false
