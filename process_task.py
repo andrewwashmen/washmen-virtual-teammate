@@ -26,6 +26,7 @@ import re
 import io
 import sys
 import json
+import time
 import base64
 import html as _html
 import requests
@@ -520,7 +521,13 @@ def process_task(task_id: str) -> None:
     print("Fetching shoe data from Supabase...")
     shoe_data = fetch_shoe_data(shoe_id)
     if not shoe_data["snapshot"]:
-        print("No approval snapshot found yet. Skipping.")
+        # Race: Lovable can write the Asana link before its Supabase snapshot
+        # is visible to anon callers. Wait briefly and retry once.
+        print("  No snapshot yet — retrying in 5s (Lovable write-order race) ...")
+        time.sleep(5)
+        shoe_data = fetch_shoe_data(shoe_id)
+    if not shoe_data["snapshot"]:
+        print("No approval snapshot found yet. Skipping (reconciler will catch up).")
         return
 
     # 4. Scrape internal notes from page (RLS blocks Supabase anon reads)
