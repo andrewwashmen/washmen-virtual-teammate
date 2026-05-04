@@ -22,10 +22,12 @@ subtask name matches an approved service name on the page.
 import os
 import threading
 import logging
+import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-from process_task import process_task, find_link, get_task
+from process_task import process_task, find_link, get_task, ASANA_BASE, _asana_headers
+from sync_task    import sync_task
 
 load_dotenv()
 
@@ -91,6 +93,52 @@ def handle_task_change(task_id: str) -> None:
             _IN_FLIGHT.discard(task_id)
 
 
+def handle_story_added(task_id: str, story_id: str) -> None:
+    """Trigger sync_task when Lovable posts an `Approval link:` comment.
+
+    Lovable adds an `Approval link: <url>` comment to the task each time the
+    customer/operator saves a change in the Service Wizard. We treat that
+    comment as a signal that Supabase has new data, and run sync_task to
+    pick up the diff.
+
+    Filters:
+      - Story must be a comment (`resource_subtype == comment_added`) — handled
+        by the dispatcher before calling this function
+      - Comment text must contain `Approval link:` — distinguishes Lovable's
+        save signal from operator chatter and avoids loops with the bot's own
+        `Updates synced ...` and `Stains & Damages` comments
+    """
+    with _IN_FLIGHT_LOCK:
+        if task_id in _IN_FLIGHT:
+            log.info("Task %s — already in flight, skipping story trigger.", task_id)
+            return
+        _IN_FLIGHT.add(task_id)
+
+    try:
+        r = requests.get(
+            f"{ASANA_BASE}/stories/{story_id}",
+            headers=_asana_headers(),
+            params={"opt_fields": "text"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        text = ((r.json() or {}).get("data") or {}).get("text") or ""
+
+        if "Approval link:" not in text:
+            log.info("Task %s — comment isn't a Lovable signal, skipping.", task_id)
+            return
+
+        log.info("Task %s — Lovable signal detected, running sync_task …", task_id)
+        sync_task(task_id, dry_run=False)
+        log.info("Task %s — sync complete.", task_id)
+
+    except Exception as exc:
+        log.error("Error syncing task %s after story event: %s", task_id, exc, exc_info=True)
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.discard(task_id)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -108,27 +156,46 @@ def webhook():
     payload = request.get_json(silent=True) or {}
     events  = payload.get("events", [])
 
-    queued = set()
+    queued_tasks = set()
+    queued_stories = set()
     for event in events:
         resource = event.get("resource", {})
+        rtype    = resource.get("resource_type")
+        action   = event.get("action")
         change   = event.get("change", {})
 
-        if (
-            resource.get("resource_type") == "task"
-            and event.get("action") == "changed"
-            and change.get("field") == "notes"
-        ):
+        # Initial Lovable post: link appears in the task notes → process_task
+        if rtype == "task" and action == "changed" and change.get("field") == "notes":
             task_id = resource.get("gid")
-            if task_id and task_id not in queued:
-                queued.add(task_id)
-                log.info("Notes updated on task %s — queuing …", task_id)
+            if task_id and task_id not in queued_tasks:
+                queued_tasks.add(task_id)
+                log.info("Notes updated on task %s — queuing process_task …", task_id)
                 threading.Thread(
                     target=handle_task_change,
                     args=(task_id,),
                     daemon=True,
                 ).start()
 
-    return jsonify({"status": "ok", "queued": len(queued)}), 200
+        # Subsequent Lovable saves: an `Approval link:` comment is added to
+        # the task → sync_task to pick up the new snapshot/damages/notes
+        elif rtype == "story" and action == "added" and resource.get("resource_subtype") == "comment_added":
+            story_id = resource.get("gid")
+            parent   = event.get("parent") or {}
+            task_id  = parent.get("gid") if parent.get("resource_type") == "task" else None
+            if task_id and story_id and (task_id, story_id) not in queued_stories:
+                queued_stories.add((task_id, story_id))
+                log.info("Comment %s added on task %s — queuing story trigger …", story_id, task_id)
+                threading.Thread(
+                    target=handle_story_added,
+                    args=(task_id, story_id),
+                    daemon=True,
+                ).start()
+
+    return jsonify({
+        "status":  "ok",
+        "tasks":   len(queued_tasks),
+        "stories": len(queued_stories),
+    }), 200
 
 
 @app.route("/health", methods=["GET"])
