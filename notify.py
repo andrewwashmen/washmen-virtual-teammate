@@ -19,7 +19,11 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+
+def _slack_webhook_url() -> Optional[str]:
+    """Lookup `SLACK_WEBHOOK_URL` lazily so callers that load .env after
+    importing this module (e.g. test scripts) still work."""
+    return os.getenv("SLACK_WEBHOOK_URL")
 
 # Phase 1 (initial callback). Lovable wrote the link, webhook fired,
 # process_task failed. Reconciler may catch it next hour, or operator
@@ -56,7 +60,8 @@ def _retry_hint(context: str, task_id: str) -> str:
 def notify_error(task_id: str, exc: BaseException, context: str,
                  task_name: Optional[str] = None) -> None:
     """Post an error alert to Slack with retry instructions."""
-    if not SLACK_WEBHOOK_URL:
+    webhook = _slack_webhook_url()
+    if not webhook:
         return
 
     err_text = f"{type(exc).__name__}: {exc}"[:1500]
@@ -82,7 +87,7 @@ def notify_error(task_id: str, exc: BaseException, context: str,
     }
 
     try:
-        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        r = requests.post(webhook, json=payload, timeout=5)
         r.raise_for_status()
     except Exception as e:
         log.error("Failed to post Slack notification for task %s: %s", task_id, e)
