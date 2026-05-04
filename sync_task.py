@@ -345,8 +345,8 @@ def sync_stains(task_id: str, damage_entries: list[dict], stains_photos: list[st
                 pt._attach_photos(task_id, stains_photos, "damage")
 
 
-def _approved_date_utc(snapshot: dict) -> Optional[date]:
-    """Parse `approved_at` as UTC date for due-date math (Q6=B)."""
+def _approved_date_dubai(snapshot: dict) -> Optional[date]:
+    """Parse `approved_at` as Dubai-local date for due-date math (Q6=B)."""
     ts = snapshot.get("approved_at")
     if not ts:
         return None
@@ -354,7 +354,7 @@ def _approved_date_utc(snapshot: dict) -> Optional[date]:
         dt = datetime.fromisoformat(ts)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).date()
+        return dt.astimezone(pt.DUBAI_TZ).date()
     except (ValueError, TypeError):
         return None
 
@@ -409,7 +409,7 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
     else:
         if current_data["total_price"] is not None:
             payload["custom_fields"] = {pt.PRICE_FIELD_GID: current_data["total_price"]}
-        approved = _approved_date_utc(current_snap)
+        approved = _approved_date_dubai(current_snap)
         tat = current_data["total_tat"]
         if approved and tat:
             due_now = approved + timedelta(days=tat)
@@ -505,7 +505,7 @@ def sync_task(task_id: str, dry_run: bool = False) -> None:
     due_was, due_now = sync_description_and_fields(task_id, current_data, current_snap, dry_run)
 
     # Post the change summary comment last
-    now_str  = datetime.now(timezone.utc).strftime("%d %b, %H:%M")
+    now_str  = datetime.now(pt.DUBAI_TZ).strftime("%d %b, %H:%M")
     summary  = build_change_summary(snap_diff, dmg_diff, now_str, due_was, due_now)
     print("  + post change-summary comment")
     if not dry_run:

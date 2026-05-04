@@ -44,6 +44,10 @@ SUPABASE_BASE = "https://onjhhntixaxumtiildwa.supabase.co"
 SUPABASE_HOST = urlparse(SUPABASE_BASE).hostname  # for SSRF check on photo URLs
 SPA_BASE      = "https://sc.washmen.com"
 
+# Dubai is UTC+4 year-round (no DST). All operator-facing timestamps and the
+# due-date calculation use this so what shows in Asana matches local clocks.
+DUBAI_TZ = timezone(timedelta(hours=4))
+
 # Hard cap on photo download size; Supabase webps are typically <500KB but we
 # defend against runaway / hostile responses that could OOM the worker.
 MAX_PHOTO_BYTES = 25 * 1024 * 1024
@@ -311,17 +315,14 @@ def _clean_entries(block: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _format_supabase_timestamp(ts: Optional[str]) -> Optional[str]:
-    """Format Supabase ISO 8601 timestamp to match the SPA's `01 May, 14:48`.
-
-    The SPA renders times in UTC without timezone conversion, so we do too.
-    """
+    """Format Supabase ISO 8601 timestamp as Dubai local time `01 May, 18:48`."""
     if not ts:
         return None
     try:
         dt = datetime.fromisoformat(ts)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt.strftime("%d %b, %H:%M")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(DUBAI_TZ).strftime("%d %b, %H:%M")
     except (ValueError, TypeError):
         return ts
 
@@ -636,9 +637,10 @@ def process_task(task_id: str) -> None:
         if data["total_price"] is not None:
             task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
         if data["total_tat"]:
-            due_date = (date.today() + timedelta(days=data["total_tat"])).strftime("%Y-%m-%d")
+            today_dubai = datetime.now(DUBAI_TZ).date()
+            due_date = (today_dubai + timedelta(days=data["total_tat"])).strftime("%Y-%m-%d")
             task_update["due_on"] = due_date
-            print(f"  Due date:    {due_date} (today + {data['total_tat']} days)")
+            print(f"  Due date:    {due_date} (today + {data['total_tat']} days, Dubai)")
 
     print("Updating task (description"
           + (", clear price + due date" if data["is_rejected"] else ", price, due date")
