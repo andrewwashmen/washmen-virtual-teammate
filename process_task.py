@@ -326,6 +326,31 @@ def _format_supabase_timestamp(ts: Optional[str]) -> Optional[str]:
         return ts
 
 
+def compute_snapshot_key(snapshot: dict, damages: list[dict]) -> str:
+    """Stable signature used by the change-detection poller.
+
+    Encodes:
+      - snapshot version (incrementing per-shoe; lets us refetch the prior
+        snapshot from Supabase for diffing on change)
+      - per-damage `<id>:<photo_count>` (damages don't version in Supabase,
+        so we keep enough state to diff add/remove + photo-count changes)
+
+    Format: `v<N> | dmg=<uuid>:<count>,<uuid>:<count>` (no `dmg=` part if
+    there are no damages).
+    """
+    version = snapshot.get("version") or 0
+    sigs: list[str] = []
+    for d in sorted(damages, key=lambda x: str(x.get("id") or "")):
+        photos = list(d.get("photo_urls") or [])
+        if not photos and d.get("photo_url"):
+            photos = [d["photo_url"]]
+        photos = [p for p in photos if p]
+        sigs.append(f"{d.get('id')}:{len(photos)}")
+    if not sigs:
+        return f"v{version}"
+    return f"v{version} | dmg=" + ",".join(sigs)
+
+
 def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
     """Assemble the unified data dict from Supabase rows + Jina internal notes."""
     snapshot = shoe_data.get("snapshot")
@@ -392,6 +417,7 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
         "damage_entries":    damage_entries,
         "sorter_suggested":  sorter_suggested,
         "internal_entries":  internal_entries,
+        "snapshot_key":      compute_snapshot_key(snapshot, damages),
     }
 
 
@@ -423,21 +449,36 @@ def _to_jpeg(content: bytes, quality: int = 88) -> bytes:
     return out.getvalue()
 
 
+def _photo_stem(url: str) -> str:
+    """Derive a stable, human-readable identifier from the source photo URL.
+
+    Supabase storage URLs end in `<timestamp>-<random>.<ext>`; we strip the
+    extension and any query string to get a stem like `1777646782293-zx1swb`.
+    The resulting filename `<service>-<stem>.jpg` lets the change-detection
+    poller match Asana attachments to source URLs deterministically.
+    """
+    basename = url.rsplit("/", 1)[-1].split("?")[0]
+    stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    return re.sub(r"[^a-zA-Z0-9_-]", "", stem) or "photo"
+
+
 def _attach_photos(task_id: str, photos: list[str], name_prefix: str) -> int:
     """Download each photo URL and upload to the Asana task as JPEG attachments.
 
     Photos are transcoded to JPEG so Asana renders them inline in the activity
     feed (webp uploads show as generic download boxes). Filenames use a slug
-    of `name_prefix` so files in the task's attachments tab correlate visually
-    with the comment they pair with (`premium-cleaning-1.jpg`, `damage-1.jpg`).
+    of `name_prefix` plus a stable stem from the source URL, e.g.
+    `damage-1777646782293-zx1swb.jpg`. The stem-based naming lets the polling
+    sync compare existing Asana attachments to current Supabase URLs without
+    re-uploading anything that hasn't changed.
 
     Returns the count of successful uploads; failures are logged but don't
     abort the rest — partial coverage beats no coverage.
     """
     slug = _slugify(name_prefix)
     success = 0
-    for i, url in enumerate(photos, 1):
-        filename = f"{slug}-{i}.jpg"
+    for url in photos:
+        filename = f"{slug}-{_photo_stem(url)}.jpg"
         try:
             content, _ = download_image(url)
             jpeg = _to_jpeg(content)
@@ -580,6 +621,10 @@ def process_task(task_id: str) -> None:
         new_notes += "\n\nInternal notes:\n" + "\n".join(f"- {e}" for e in data["internal_entries"])
     if data["sorter_suggested"]:
         new_notes += "\n\nSorter Suggested:\n" + ", ".join(data["sorter_suggested"]) + "."
+    if data.get("snapshot_key"):
+        # Used by the change-detection poller to know what was processed last.
+        # Visible to operators as a debug aid; safe to ignore in normal use.
+        new_notes += "\n\nSnapshot key: " + data["snapshot_key"]
 
     # Rejected orders: clear price + due date (no agreed work — leftover values
     # from prior runs would be misleading). Approved orders: set both.
