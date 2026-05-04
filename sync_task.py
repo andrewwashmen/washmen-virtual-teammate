@@ -199,7 +199,9 @@ def _join_names(names: list[str]) -> str:
 
 def build_change_summary(snap_diff: dict, dmg_diff: dict, now_str: str,
                          due_was: Optional[date], due_now: Optional[date]) -> str:
-    parts = [f"<body><strong>Updates synced &middot; {_html.escape(now_str)}</strong><ul>"]
+    # Use raw Unicode chars (·, →) — Asana doesn't render named HTML entities
+    # like &middot; and &rarr;, they show as literal text.
+    parts = [f"<body><strong>Updates synced · {_html.escape(now_str)}</strong><ul>"]
 
     if snap_diff["services_added"]:
         parts.append(f"<li><strong>Services added:</strong> {_join_names(snap_diff['services_added'])}</li>")
@@ -220,12 +222,12 @@ def build_change_summary(snap_diff: dict, dmg_diff: dict, now_str: str,
 
     if snap_diff["total_price_changed"]:
         parts.append(
-            f"<li><strong>Total:</strong> AED {snap_diff['old_total_price']} &rarr; AED {snap_diff['new_total_price']}</li>"
+            f"<li><strong>Total:</strong> AED {snap_diff['old_total_price']} → AED {snap_diff['new_total_price']}</li>"
         )
     if snap_diff["tat_changed"]:
-        msg = f"{snap_diff['old_tat']}d &rarr; {snap_diff['new_tat']}d"
+        msg = f"{snap_diff['old_tat']}d → {snap_diff['new_tat']}d"
         if due_was and due_now and due_was != due_now:
-            msg += f" (due {due_was.isoformat()} &rarr; {due_now.isoformat()})"
+            msg += f" (due {due_was.isoformat()} → {due_now.isoformat()})"
         parts.append(f"<li><strong>TAT:</strong> {msg}</li>")
 
     parts.append("</ul></body>")
