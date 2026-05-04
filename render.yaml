@@ -15,3 +15,20 @@ services:
         sync: false   # set manually in dashboard (secret)
       - key: ASANA_PROJECT_GID
         value: "1202289964354061"
+
+  # Cron job for change-detection sync. Polls eligible tasks every 10 min
+  # and runs sync_task on each — see poll_for_changes.py for the eligibility
+  # filter. sync_task is itself idempotent, so a brief overlap with the
+  # webhook (different process) self-corrects on the next cycle.
+  - type: cron
+    name: washmen-virtual-teammate-poller
+    runtime: python
+    plan: starter
+    schedule: "*/10 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python poll_for_changes.py
+    envVars:
+      - key: ASANA_PAT
+        sync: false
+      - key: ASANA_PROJECT_GID
+        value: "1202289964354061"
