@@ -39,6 +39,19 @@ import process_task as pt
 
 _SNAPSHOT_LINE_RE = re.compile(r"^Snapshot key:\s+(.+)$", re.MULTILINE)
 _SNAPSHOT_BODY_RE = re.compile(r"v(\d+)(?:\s*\|\s*dmg=(.+))?")
+_INTERNAL_NOTES_RE = re.compile(r"\nInternal notes:\n((?:- [^\n]+\n?)+)")
+
+
+def parse_internal_notes_from_description(notes: str) -> list[str]:
+    """Extract the list of internal-notes bullets the bot last wrote."""
+    m = _INTERNAL_NOTES_RE.search(notes)
+    if not m:
+        return []
+    return [
+        line[2:].strip()
+        for line in m.group(1).strip().split("\n")
+        if line.startswith("- ")
+    ]
 
 
 def parse_snapshot_key(notes: str) -> Optional[dict]:
@@ -197,8 +210,22 @@ def _join_names(names: list[str]) -> str:
     return ", ".join(_html.escape(n) for n in names)
 
 
+def _internal_notes_summary(prev: list[str], curr: list[str]) -> Optional[str]:
+    """Human-readable description of how the internal-notes set changed."""
+    if prev == curr:
+        return None
+    delta = len(curr) - len(prev)
+    if delta > 0:
+        return f"{delta} new note{'s' if delta != 1 else ''} added"
+    if delta < 0:
+        n = -delta
+        return f"{n} note{'s' if n != 1 else ''} removed"
+    return "edited"
+
+
 def build_change_summary(snap_diff: dict, dmg_diff: dict, now_str: str,
-                         due_was: Optional[date], due_now: Optional[date]) -> str:
+                         due_was: Optional[date], due_now: Optional[date],
+                         internal_summary: Optional[str] = None) -> str:
     # Use raw Unicode chars (·, →) — Asana doesn't render named HTML entities
     # like &middot; and &rarr;, they show as literal text.
     parts = [f"<body><strong>Updates synced · {_html.escape(now_str)}</strong><ul>"]
@@ -229,6 +256,9 @@ def build_change_summary(snap_diff: dict, dmg_diff: dict, now_str: str,
         if due_was and due_now and due_was != due_now:
             msg += f" (due {due_was.isoformat()} → {due_now.isoformat()})"
         parts.append(f"<li><strong>TAT:</strong> {msg}</li>")
+
+    if internal_summary:
+        parts.append(f"<li><strong>Internal notes:</strong> {_html.escape(internal_summary)}</li>")
 
     parts.append("</ul></body>")
     return "".join(parts)
@@ -418,7 +448,7 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
             payload["due_on"] = due_now.isoformat()
 
     print(f"  update description + custom fields"
-          + (f" (due {due_was} → {due_now})" if due_now and due_now != due_was else ""))
+          + (f" (due {due_was} -> {due_now})" if due_now and due_now != due_was else ""))
     if not dry_run:
         pt.update_task(task_id, payload)
     return due_was, due_now
@@ -465,50 +495,55 @@ def sync_task(task_id: str, dry_run: bool = False) -> None:
     current_key = pt.compute_snapshot_key(current_snap, current_damages)
     print(f"Stored key:  {stored['raw']}")
     print(f"Current key: {current_key}")
+    snapshot_changed = current_key != stored["raw"]
 
-    if current_key == stored["raw"]:
+    # Internal notes aren't part of the snapshot key (Supabase RLS hides the
+    # table from anon, and we'd need a Jina scrape per cycle to hash them).
+    # Instead, scrape now and compare against what's in the description.
+    try:
+        current_internal = pt.scrape_internal_notes(link)
+    except Exception as e:
+        print(f"  internal-notes scrape failed: {e} (continuing without)")
+        current_internal = []
+    prev_internal = parse_internal_notes_from_description(notes)
+    internal_summary = _internal_notes_summary(prev_internal, current_internal)
+    if internal_summary:
+        print(f"Internal notes: {internal_summary} ({len(prev_internal)} -> {len(current_internal)})")
+
+    if not snapshot_changed and not internal_summary:
         print("No changes detected.")
         return
 
-    # Fetch the historic snapshot we last processed so we can diff services
-    prev_snap = fetch_snapshot_by_version(shoe_id, stored["version"])
-    if prev_snap is None:
-        print(f"WARN: previous snapshot v{stored['version']} not found in Supabase; skipping.")
-        return
+    # Compute service/damage diff only when the snapshot key changed
+    if snapshot_changed:
+        prev_snap = fetch_snapshot_by_version(shoe_id, stored["version"])
+        if prev_snap is None:
+            print(f"WARN: previous snapshot v{stored['version']} not found in Supabase; skipping.")
+            return
+        snap_diff = diff_snapshots(prev_snap, current_snap)
+        dmg_diff  = diff_damages(stored["damages"], current_damages)
+    else:
+        snap_diff = {
+            "services_added": [], "services_removed": [], "services_updated": [],
+            "total_price_changed": False, "old_total_price": None, "new_total_price": None,
+            "tat_changed": False, "old_tat": None, "new_tat": None,
+        }
+        dmg_diff = {"added": [], "removed_count": 0, "updated": []}
 
-    snap_diff = diff_snapshots(prev_snap, current_snap)
-    dmg_diff  = diff_damages(stored["damages"], current_damages)
+    current_data = pt.build_data(shoe_data, current_internal)
 
-    if not has_changes(snap_diff, dmg_diff):
-        print("Snapshot key differs but no semantic changes detected (probably internal-notes shuffle). Updating key only.")
-        # Just update the key line so we stop comparing repeatedly.
-        if not dry_run:
-            try:
-                internal_entries = pt.scrape_internal_notes(link)
-            except Exception:
-                internal_entries = []
-            current_data = pt.build_data(shoe_data, internal_entries)
-            sync_description_and_fields(task_id, current_data, current_snap, dry_run=False)
-        return
-
-    # Pull internal notes (still scraped via Jina; RLS hides the table)
-    try:
-        internal_entries = pt.scrape_internal_notes(link)
-    except Exception as e:
-        print(f"  internal-notes scrape failed: {e} (continuing without)")
-        internal_entries = []
-    current_data = pt.build_data(shoe_data, internal_entries)
-
-    # Apply state syncs
-    sync_subtasks(task_id, current_data["approved_services"], dry_run)
-    sync_service_photos(task_id, current_data["approved_services"], dry_run)
-    if dmg_diff["added"] or dmg_diff["removed_count"] or dmg_diff["updated"]:
-        sync_stains(task_id, current_data["damage_entries"], current_data["stains_photos"], dry_run)
+    # Apply state syncs (only the parts that changed)
+    if snapshot_changed:
+        sync_subtasks(task_id, current_data["approved_services"], dry_run)
+        sync_service_photos(task_id, current_data["approved_services"], dry_run)
+        if dmg_diff["added"] or dmg_diff["removed_count"] or dmg_diff["updated"]:
+            sync_stains(task_id, current_data["damage_entries"], current_data["stains_photos"], dry_run)
+    # Description rewrite always runs (picks up notes change, refreshes Snapshot key)
     due_was, due_now = sync_description_and_fields(task_id, current_data, current_snap, dry_run)
 
     # Post the change summary comment last
-    now_str  = datetime.now(pt.DUBAI_TZ).strftime("%d %b, %H:%M")
-    summary  = build_change_summary(snap_diff, dmg_diff, now_str, due_was, due_now)
+    now_str = datetime.now(pt.DUBAI_TZ).strftime("%d %b, %H:%M")
+    summary = build_change_summary(snap_diff, dmg_diff, now_str, due_was, due_now, internal_summary)
     print("  + post change-summary comment")
     if not dry_run:
         pt.add_comment(task_id, summary)
