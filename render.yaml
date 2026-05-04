@@ -15,3 +15,21 @@ services:
         sync: false   # set manually in dashboard (secret)
       - key: ASANA_PROJECT_GID
         value: "1202289964354061"
+
+  # Reconciler: runs hourly, finds tasks with the Lovable link in notes
+  # but no Approved/Rejected marker, and runs process_task on each. Pure
+  # safety net — under normal operation it finds nothing because the
+  # live webhook handles every event. Catches missed events from Render
+  # restarts, network blips, or webhook delivery failures.
+  - type: cron
+    name: washmen-virtual-teammate-reconciler
+    runtime: python
+    plan: starter
+    schedule: "0 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python reconcile_missed.py
+    envVars:
+      - key: ASANA_PAT
+        sync: false
+      - key: ASANA_PROJECT_GID
+        value: "1202289964354061"
