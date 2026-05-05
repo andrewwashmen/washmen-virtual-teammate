@@ -245,9 +245,13 @@ def download_image(url: str) -> tuple[bytes, str]:
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ValueError(f"refusing non-HTTPS image URL: {url!r}")
-    expected_host = urlparse(_get_supabase_base()).hostname
-    if parsed.hostname != expected_host:
-        raise ValueError(f"refusing image URL from unexpected host: {parsed.hostname!r}")
+    # Allow any Supabase project host. After Washmen's project migration,
+    # some pre-existing rows in the new project still reference photo URLs
+    # on the old project's storage host — pinning to the *current* project
+    # only would reject those legitimate URLs.
+    host = parsed.hostname or ""
+    if not host.endswith(".supabase.co"):
+        raise ValueError(f"refusing image URL from unexpected host: {host!r}")
 
     with requests.get(url, timeout=30, stream=True) as r:
         r.raise_for_status()

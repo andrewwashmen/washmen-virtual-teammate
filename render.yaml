@@ -37,3 +37,22 @@ services:
         value: "1202289964354061"
       - key: SLACK_WEBHOOK_URL
         sync: false
+
+  # Sync reconciler: runs every 15 minutes, finds already-processed tasks
+  # whose stored Snapshot key differs from Supabase's current state, and
+  # runs sync_task on each. Safety net for the case where Lovable updates
+  # Supabase but doesn't post the `Approval link:` trigger comment.
+  - type: cron
+    name: washmen-virtual-teammate-sync-reconciler
+    runtime: python
+    plan: starter
+    schedule: "*/15 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python reconcile_changes.py
+    envVars:
+      - key: ASANA_PAT
+        sync: false
+      - key: ASANA_PROJECT_GID
+        value: "1202289964354061"
+      - key: SLACK_WEBHOOK_URL
+        sync: false
