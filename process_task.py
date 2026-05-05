@@ -41,9 +41,7 @@ load_dotenv()
 ASANA_PAT     = os.getenv("ASANA_PAT")
 ASANA_BASE    = "https://app.asana.com/api/1.0"
 JINA_BASE     = "https://r.jina.ai"
-SUPABASE_BASE = "https://onjhhntixaxumtiildwa.supabase.co"
-SUPABASE_HOST = urlparse(SUPABASE_BASE).hostname  # for SSRF check on photo URLs
-SPA_BASE      = "https://sc.washmen.com"
+SPA_BASE = "https://sc.washmen.com"
 
 # Dubai is UTC+4 year-round (no DST). All operator-facing timestamps and the
 # due-date calculation use this so what shows in Asana matches local clocks.
@@ -63,10 +61,14 @@ LINK_PATTERNS = [
 ]
 SHOE_ID_RE = re.compile(r"/approved/([a-f0-9\-]{36})")
 
-# Cache for the Supabase anon key. The key is public — every browser visiting
-# sc.washmen.com receives it in the JS bundle — so this isn't a leak. RLS on
-# the Supabase tables governs what data anon callers can actually read.
-_ANON_KEY: Optional[str] = None
+# Cache for the Supabase config (URL + anon key). Both are discovered from
+# the SPA's JS bundle. The anon key is public — every browser visiting
+# sc.washmen.com receives it — so caching it isn't a leak. RLS on the
+# Supabase tables governs what data anon callers can read. Discovering the
+# URL dynamically means a project migration on Washmen's side doesn't
+# require a code change here.
+_SUPABASE_BASE: Optional[str] = None
+_ANON_KEY:      Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,15 +152,17 @@ def upload_attachment(task_id: str, filename: str, content: bytes,
 # Supabase API
 # ---------------------------------------------------------------------------
 
-def _get_anon_key() -> str:
-    """Extract the public Supabase anon key from the SPA's JS bundle (cached).
+def _discover_supabase_config() -> tuple[str, str]:
+    """Discover Supabase base URL + anon key from the SPA's JS bundle (cached).
 
-    The bundle may embed multiple JWTs in the future (third-party SDKs, etc.),
-    so pick by `role=anon` rather than first-match.
+    The bundle may embed multiple JWTs (third-party SDKs, etc.), so we pick
+    by `role=anon` rather than first-match. The Supabase URL likewise is
+    found by regex match against the bundle, so a project migration on
+    Washmen's side doesn't require a code change here.
     """
-    global _ANON_KEY
-    if _ANON_KEY:
-        return _ANON_KEY
+    global _SUPABASE_BASE, _ANON_KEY
+    if _SUPABASE_BASE and _ANON_KEY:
+        return _SUPABASE_BASE, _ANON_KEY
 
     html = requests.get(SPA_BASE, timeout=15).text
     js_match = re.search(r'src="(/assets/index-[^"]+\.js)"', html)
@@ -166,6 +170,12 @@ def _get_anon_key() -> str:
         raise RuntimeError("Could not locate JS bundle in Service Wizard SPA HTML")
     js = requests.get(SPA_BASE + js_match.group(1), timeout=30).text
 
+    sb_match = re.search(r"https://[a-z0-9]+\.supabase\.co", js)
+    if not sb_match:
+        raise RuntimeError("Could not find Supabase URL in JS bundle")
+    base = sb_match.group(0)
+
+    anon_key = None
     for jwt in re.findall(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", js):
         try:
             payload_b64 = jwt.split(".")[1]
@@ -174,15 +184,27 @@ def _get_anon_key() -> str:
         except (ValueError, json.JSONDecodeError):
             continue
         if payload.get("role") == "anon":
-            _ANON_KEY = jwt
-            return _ANON_KEY
-    raise RuntimeError("Could not find a role=anon JWT in the JS bundle")
+            anon_key = jwt
+            break
+    if not anon_key:
+        raise RuntimeError("Could not find a role=anon JWT in the JS bundle")
+
+    _SUPABASE_BASE, _ANON_KEY = base, anon_key
+    return base, anon_key
+
+
+def _get_anon_key() -> str:
+    return _discover_supabase_config()[1]
+
+
+def _get_supabase_base() -> str:
+    return _discover_supabase_config()[0]
 
 
 def _supabase_get(table: str, params: dict) -> list:
-    key = _get_anon_key()
+    base, key = _discover_supabase_config()
     r = requests.get(
-        f"{SUPABASE_BASE}/rest/v1/{table}",
+        f"{base}/rest/v1/{table}",
         headers={"apikey": key, "Authorization": f"Bearer {key}"},
         params=params,
         timeout=15,
@@ -223,7 +245,8 @@ def download_image(url: str) -> tuple[bytes, str]:
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise ValueError(f"refusing non-HTTPS image URL: {url!r}")
-    if parsed.hostname != SUPABASE_HOST:
+    expected_host = urlparse(_get_supabase_base()).hostname
+    if parsed.hostname != expected_host:
         raise ValueError(f"refusing image URL from unexpected host: {parsed.hostname!r}")
 
     with requests.get(url, timeout=30, stream=True) as r:
