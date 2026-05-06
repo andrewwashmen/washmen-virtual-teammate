@@ -458,6 +458,12 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
             due_now = approved + timedelta(days=tat)
             payload["due_on"] = due_now.isoformat()
 
+    # Service → custom field mappings. Approved-derived fields fully overwrite,
+    # sorter-derived fields preserve. Same shared helper used by process_task.
+    service_field_payload = pt.compute_service_field_mappings(current_data, task.get("custom_fields"))
+    if service_field_payload:
+        payload.setdefault("custom_fields", {}).update(service_field_payload)
+
     print(f"  update description + custom fields"
           + (f" (due {due_was} -> {due_now})" if due_now and due_now != due_was else ""))
     if not dry_run:

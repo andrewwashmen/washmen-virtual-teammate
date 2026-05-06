@@ -52,11 +52,19 @@ DUBAI_TZ = timezone(timedelta(hours=4))
 MAX_PHOTO_BYTES = 25 * 1024 * 1024
 
 # Custom field GIDs
-PRICE_FIELD_GID                    = "1202480206903933"
-ASSESSMENT_FIELD_GID               = "1213817197288597"
-ASSESSMENT_DONE_OPTION_GID         = "1213817197288598"
-REASON_FOR_REJECTION_FIELD_GID     = "1202637830332848"  # multi_enum
-INTERNAL_REJECTION_REASON_FIELD_GID = "1214569192694597"  # enum (single)
+PRICE_FIELD_GID                        = "1202480206903933"
+ASSESSMENT_FIELD_GID                   = "1213817197288597"
+ASSESSMENT_DONE_OPTION_GID             = "1213817197288598"
+REASON_FOR_REJECTION_FIELD_GID         = "1202637830332848"  # multi_enum
+INTERNAL_REJECTION_REASON_FIELD_GID    = "1214569192694597"  # enum (single)
+
+# Service-derived custom fields
+BASIC_CLEANING_FIELD_GID                = "1202479042267508"  # multi_enum
+RESTORATION_TYPE_FIELD_GID              = "1205098532466207"  # enum
+REPAIR_OUTSIDE_RESTORATION_FIELD_GID    = "1202289964354087"  # multi_enum
+BUNDLE_ADD_ONS_FIELD_GID                = "1202478633477805"  # multi_enum
+RECOMMENDED_RESTORATION_TYPE_FIELD_GID  = "1207502856950634"  # enum
+RECOMMENDED_REPAIR_FIELD_GID            = "1207502856950639"  # multi_enum
 
 # Customer-facing rejection reasons → Asana option GIDs for the multi_enum
 # "Reason for Rejection:" field. Used when source='customer' (the customer
@@ -631,6 +639,257 @@ def apply_rejection_reason_field(task_update: dict, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Service → custom field mappings (Basic Cleaning, Restoration type,
+# Repair (Outside Restoration), Bundle Add Ons, plus the Recommended
+# variants on the Sorter Suggested side)
+# ---------------------------------------------------------------------------
+#
+# Behavior summary:
+#   - Approved-services-derived fields (Basic Cleaning, Restoration type,
+#     Repair (Outside Restoration), Bundle Add Ons) are FULLY managed —
+#     overwritten on every run, can be cleared if no matching service is
+#     present. This keeps Asana state in lockstep with the customer's
+#     latest decision.
+#   - Sorter-Suggested-derived fields (Recommended Restoration Type,
+#     Recommended Repair) are PRESERVED — the bot only sets/adds, never
+#     removes. The operator's original recommendation is treated as a
+#     historical record.
+#
+# Asana option GIDs are auto-discovered at first call by reading the
+# project's custom_field_settings, so adding new options to a field in
+# Asana is a config change — no code update needed.
+
+# Subtask name (lowercase) → list of Basic Cleaning option labels to set
+SUBTASK_TO_BASIC_CLEANING_OPTIONS: dict[str, list[str]] = {
+    "premium cleaning":                ["BASIC CLEANING"],
+    "suede cleaning":                  ["BASIC CLEANING"],
+    "cleaning + color restoration":    ["BASIC CLEANING"],
+    "cleaning + minor color touch up": ["BASIC CLEANING"],
+    "leather polishing & cleaning":    ["BASIC CLEANING", "POLISHING"],
+}
+
+# Subtask name (lowercase) → Restoration type option label
+SUBTASK_TO_RESTORATION_TYPE: dict[str, str] = {
+    "cleaning + color restoration":    "Full-color restoration",
+    "cleaning + minor color touch up": "Minor-color touch up ",  # trailing space matches the Asana option label
+}
+
+# Subtask name (lowercase) → Repair (Outside Restoration) option label.
+# Subtasks not in this map don't contribute to the field. Loro Piana Resoling,
+# Full Sole Protection, and Sole Stitching require Asana options to exist with
+# those exact names; auto-discovery picks them up once added.
+SUBTASK_TO_REPAIR_OPTION: dict[str, str] = {
+    "loro piana resoling":         "Loro Piana Resoling",
+    "heel tip replacement":        "Heel Tip Replacement",
+    "rubber heel replacement":     "Rubber Heel",
+    "full sole protection":        "Full Sole Protection",
+    "full resoling":               "Full Resoling",
+    "leather insole replacement":  "Leather Insole Replacement",
+    "shoe stretching":             "Shoe Stretching",
+    "sole stitching":              "Sole Stitching",
+    "major gluing":                "Major Gluing",
+    "major stitching":              "Major Stitching",
+}
+
+# Subtask name (lowercase) → Bundle Add Ons option label.
+# Shoes Color Change, Sanitize & Deodorize, Laces Replacement require Asana
+# options with those exact names; auto-discovery picks them up once added.
+SUBTASK_TO_BUNDLE_ADD_ONS_OPTION: dict[str, str] = {
+    "shoes color change":          "Shoes Color Change",
+    "sanitize & deodorize":        "Sanitize & Deodorize",
+    "laces replacement":           "Laces Replacement",
+    "icing":                       "ICING",
+    "stain protection":            "STAIN PROTECTION",
+}
+
+# Sorter Suggested name (lowercase) → Recommended Restoration Type option label
+SUGGESTION_TO_RECOMMENDED_RESTORATION_TYPE: dict[str, str] = {
+    "cleaning + color restoration":    "Full Color Restoration",
+    "cleaning + minor color touch up": "Minor Color Touch Up",
+}
+
+# Sorter Suggested name (lowercase) → Recommended Repair option label.
+# Same name set as the approved-side Repair mapping.
+SUGGESTION_TO_RECOMMENDED_REPAIR_OPTION: dict[str, str] = SUBTASK_TO_REPAIR_OPTION
+
+
+# Cache: {field_gid: {option_name_lower: option_gid}}. Populated on first call
+# to _option_gid() per process. Reset on process restart (Render redeploy).
+_OPTION_LOOKUP_CACHE: Optional[dict[str, dict[str, str]]] = None
+
+
+def _build_option_lookup() -> dict[str, dict[str, str]]:
+    """Discover all enum option GIDs on the project. Cached for the worker."""
+    global _OPTION_LOOKUP_CACHE
+    if _OPTION_LOOKUP_CACHE is not None:
+        return _OPTION_LOOKUP_CACHE
+
+    project_gid = os.getenv("ASANA_PROJECT_GID", "1202289964354061")
+    try:
+        r = requests.get(
+            f"{ASANA_BASE}/projects/{project_gid}/custom_field_settings",
+            headers=_asana_headers(),
+            params={
+                "opt_fields": "custom_field.gid,custom_field.enum_options.gid,custom_field.enum_options.name",
+                "limit":      100,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        # Don't cache the failure — let the next call retry.
+        print(f"  WARN: option lookup fetch failed ({e}); service field mapping degraded this run")
+        return {}
+
+    lookup: dict[str, dict[str, str]] = {}
+    for setting in r.json().get("data", []):
+        cf = setting.get("custom_field") or {}
+        field_gid = cf.get("gid")
+        if not field_gid:
+            continue
+        options = cf.get("enum_options") or []
+        lookup[field_gid] = {
+            (o.get("name") or "").strip().lower(): o.get("gid")
+            for o in options
+            if o.get("gid") and (o.get("name") or "").strip()
+        }
+
+    _OPTION_LOOKUP_CACHE = lookup
+    return lookup
+
+
+def _option_gid(field_gid: str, option_label: str) -> Optional[str]:
+    """Look up an option's GID by its label (case-insensitive)."""
+    lookup = _build_option_lookup()
+    field_options = lookup.get(field_gid) or {}
+    return field_options.get((option_label or "").strip().lower())
+
+
+def _current_multi_enum_gids(current_custom_fields: list, field_gid: str) -> set[str]:
+    """Pull the current set of multi_enum option GIDs from a get_task payload."""
+    out: set[str] = set()
+    for cf in current_custom_fields or []:
+        if cf.get("gid") != field_gid:
+            continue
+        for v in cf.get("multi_enum_values") or []:
+            g = v.get("gid")
+            if g:
+                out.add(g)
+        break
+    return out
+
+
+def compute_service_field_mappings(data: dict, current_custom_fields: list) -> dict:
+    """Compute the custom_fields payload mapping subtasks/Sorter Suggested → fields.
+
+    Returns a partial `custom_fields` dict ready to merge into a task_update
+    payload. Implements the asymmetric sync behavior described above:
+      - Approved-derived fields: full overwrite (always written, may clear)
+      - Sorter-derived fields: only set/add, never remove
+
+    Unrecognized service names log a warning and are skipped (no guessing).
+    """
+    payload: dict[str, object] = {}
+
+    services = [
+        (s.get("name") or "").strip().lower()
+        for s in (data.get("approved_services") or [])
+        if (s.get("name") or "").strip()
+    ]
+    suggestions = [
+        (s or "").strip().lower()
+        for s in (data.get("sorter_suggested") or [])
+        if (s or "").strip()
+    ]
+
+    # ─── Approved-derived: Basic Cleaning (multi_enum, full overwrite) ─────
+    basic_labels: set[str] = set()
+    for svc in services:
+        for label in SUBTASK_TO_BASIC_CLEANING_OPTIONS.get(svc, []):
+            basic_labels.add(label)
+    basic_gids: list[str] = []
+    for label in basic_labels:
+        gid = _option_gid(BASIC_CLEANING_FIELD_GID, label)
+        if gid:
+            basic_gids.append(gid)
+        else:
+            print(f"  Basic Cleaning: option {label!r} not found in Asana; skipping")
+    payload[BASIC_CLEANING_FIELD_GID] = basic_gids
+
+    # ─── Approved-derived: Restoration type (enum, full overwrite) ─────────
+    restoration_label: Optional[str] = None
+    for svc in services:
+        if svc in SUBTASK_TO_RESTORATION_TYPE:
+            restoration_label = SUBTASK_TO_RESTORATION_TYPE[svc]
+            break
+    if restoration_label:
+        gid = _option_gid(RESTORATION_TYPE_FIELD_GID, restoration_label)
+        payload[RESTORATION_TYPE_FIELD_GID] = gid  # may be None if option not yet in Asana
+        if not gid:
+            print(f"  Restoration type: option {restoration_label!r} not found; clearing field")
+    else:
+        payload[RESTORATION_TYPE_FIELD_GID] = None
+
+    # ─── Approved-derived: Repair (Outside Restoration) (multi_enum) ───────
+    repair_gids: list[str] = []
+    for svc in services:
+        label = SUBTASK_TO_REPAIR_OPTION.get(svc)
+        if not label:
+            continue
+        gid = _option_gid(REPAIR_OUTSIDE_RESTORATION_FIELD_GID, label)
+        if gid:
+            repair_gids.append(gid)
+        else:
+            print(f"  Repair (Outside Restoration): option {label!r} not found; skipping")
+    payload[REPAIR_OUTSIDE_RESTORATION_FIELD_GID] = repair_gids
+
+    # ─── Approved-derived: Bundle Add Ons (multi_enum) ─────────────────────
+    bundle_gids: list[str] = []
+    for svc in services:
+        label = SUBTASK_TO_BUNDLE_ADD_ONS_OPTION.get(svc)
+        if not label:
+            continue
+        gid = _option_gid(BUNDLE_ADD_ONS_FIELD_GID, label)
+        if gid:
+            bundle_gids.append(gid)
+        else:
+            print(f"  Bundle Add Ons: option {label!r} not found; skipping")
+    payload[BUNDLE_ADD_ONS_FIELD_GID] = bundle_gids
+
+    # ─── Sorter-derived: Recommended Restoration Type (preserve) ───────────
+    rec_restoration_label: Optional[str] = None
+    for sug in suggestions:
+        if sug in SUGGESTION_TO_RECOMMENDED_RESTORATION_TYPE:
+            rec_restoration_label = SUGGESTION_TO_RECOMMENDED_RESTORATION_TYPE[sug]
+            break
+    if rec_restoration_label:
+        gid = _option_gid(RECOMMENDED_RESTORATION_TYPE_FIELD_GID, rec_restoration_label)
+        if gid:
+            payload[RECOMMENDED_RESTORATION_TYPE_FIELD_GID] = gid
+        else:
+            print(f"  Recommended Restoration Type: option {rec_restoration_label!r} not found; preserving")
+    # No write when there's no match → existing value preserved.
+
+    # ─── Sorter-derived: Recommended Repair (additive merge) ───────────────
+    current_rec_repair = _current_multi_enum_gids(current_custom_fields, RECOMMENDED_REPAIR_FIELD_GID)
+    new_rec_repair = set(current_rec_repair)
+    for sug in suggestions:
+        label = SUGGESTION_TO_RECOMMENDED_REPAIR_OPTION.get(sug)
+        if not label:
+            continue
+        gid = _option_gid(RECOMMENDED_REPAIR_FIELD_GID, label)
+        if gid:
+            new_rec_repair.add(gid)
+        else:
+            print(f"  Recommended Repair: option {label!r} not found; skipping")
+    if new_rec_repair != current_rec_repair:
+        payload[RECOMMENDED_REPAIR_FIELD_GID] = list(new_rec_repair)
+    # No write when nothing new → existing values preserved.
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
 
@@ -791,17 +1050,27 @@ def process_task(task_id: str) -> None:
         task_update["due_on"]        = None
         apply_rejection_reason_field(task_update, data)
     else:
+        task_update["custom_fields"] = {}
         if data["total_price"] is not None:
-            task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
+            task_update["custom_fields"][PRICE_FIELD_GID] = data["total_price"]
         if data["total_tat"]:
             today_dubai = datetime.now(DUBAI_TZ).date()
             due_date = (today_dubai + timedelta(days=data["total_tat"])).strftime("%Y-%m-%d")
             task_update["due_on"] = due_date
             print(f"  Due date:    {due_date} (today + {data['total_tat']} days, Dubai)")
 
+    # Service → custom field mappings (Basic Cleaning, Restoration type, Repair
+    # (Outside Restoration), Bundle Add Ons, Recommended Restoration Type,
+    # Recommended Repair). Runs for both approved and rejected branches —
+    # for rejected, the approved-derived fields get cleared (services list
+    # is empty), and the sorter-derived fields are preserved.
+    service_field_payload = compute_service_field_mappings(data, task.get("custom_fields"))
+    if service_field_payload:
+        task_update.setdefault("custom_fields", {}).update(service_field_payload)
+
     print("Updating task (description"
           + (", clear price + due date" if data["is_rejected"] else ", price, due date")
-          + ")...")
+          + ", service custom fields)...")
     update_task(task_id, task_update)
 
     print("\nDone!")
