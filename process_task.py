@@ -72,8 +72,10 @@ REJECTION_REASON_OPTIONS = {
     "pricing":                                 "1202637830332849",
     # "Turn around time"
     "turn around time":                        "1202637830332850",
+    "turnaround time":                         "1202637830332850",
     # "Repair service not available"
     "repair service not available":            "1202637830332851",
+    "service not available":                   "1202637830332851",
     # "Replacement items not available"
     "replacement items not available":         "1202637830332852",
     # "Customer Is Not Happy"
