@@ -52,9 +52,27 @@ DUBAI_TZ = timezone(timedelta(hours=4))
 MAX_PHOTO_BYTES = 25 * 1024 * 1024
 
 # Custom field GIDs
-PRICE_FIELD_GID            = "1202480206903933"
-ASSESSMENT_FIELD_GID       = "1213817197288597"
-ASSESSMENT_DONE_OPTION_GID = "1213817197288598"
+PRICE_FIELD_GID                = "1202480206903933"
+ASSESSMENT_FIELD_GID           = "1213817197288597"
+ASSESSMENT_DONE_OPTION_GID     = "1213817197288598"
+REASON_FOR_REJECTION_FIELD_GID = "1202637830332848"
+
+# Lovable's rejection_reason string (from the Supabase snapshot) → Asana option
+# GID for the multi-enum "Reason for Rejection:" field. Matched case-insensitive
+# with whitespace stripped. Unrecognized reasons are logged and skipped — the
+# field stays empty, the rest of the rejection pipeline proceeds normally.
+REJECTION_REASON_OPTIONS = {
+    "pricing":                                 "1202637830332849",
+    "turn around time":                        "1202637830332850",
+    "repair service not available":            "1202637830332851",
+    "replacement items not available":         "1202637830332852",
+    "customer changed their mind":             "1202675156630741",
+    "sent wrong pair of shoes/bag":            "1202956846480528",
+    "customer does not want any color change": "1203147939016011",
+    "donation":                                "1206664031863519",
+    "transfer to finery":                      "1207355056904088",
+    "item not processed":                      "1207459611389499",
+}
 
 # Approval URLs from both the Lovable preview and the Washmen production domain
 LINK_PATTERNS = [
@@ -679,6 +697,17 @@ def process_task(task_id: str) -> None:
     if data["is_rejected"]:
         task_update["custom_fields"] = {PRICE_FIELD_GID: None}
         task_update["due_on"]        = None
+        # Mirror the customer's rejection reason into the Asana custom field.
+        # The field is multi_enum, so values go in a list. Unrecognized reason
+        # strings are logged and skipped (field stays empty rather than
+        # surfacing a misleading mapping).
+        rj = (data.get("rejection_reason") or "").strip().lower()
+        rj_option = REJECTION_REASON_OPTIONS.get(rj)
+        if rj_option:
+            task_update["custom_fields"][REASON_FOR_REJECTION_FIELD_GID] = [rj_option]
+            print(f"  Reason for Rejection: {data['rejection_reason']}")
+        elif rj:
+            print(f"  Reason for Rejection: unrecognized {data['rejection_reason']!r}; field left empty")
     else:
         if data["total_price"] is not None:
             task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
