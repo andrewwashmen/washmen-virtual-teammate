@@ -61,17 +61,39 @@ INTERNAL_REJECTION_REASON_FIELD_GID = "1214569192694597"  # enum (single)
 # Customer-facing rejection reasons → Asana option GIDs for the multi_enum
 # "Reason for Rejection:" field. Used when source='customer' (the customer
 # rejected via the Wizard). Matched case-insensitive with whitespace stripped.
+#
+# Lovable's customer-facing strings are shorter than Asana's option labels
+# (e.g. "Changed my mind" vs the Asana option "Customer Changed their Mind"),
+# so we register both forms — Asana label AND the Wizard's literal string —
+# as keys that point to the same option GID. Add new aliases whenever an
+# unrecognized-reason warning appears in the logs.
 REJECTION_REASON_OPTIONS = {
+    # "Pricing"
     "pricing":                                 "1202637830332849",
+    # "Turn around time"
     "turn around time":                        "1202637830332850",
+    # "Repair service not available"
     "repair service not available":            "1202637830332851",
+    # "Replacement items not available"
     "replacement items not available":         "1202637830332852",
+    # "Customer Is Not Happy"
     "customer is not happy":                   "1202650445593181",
+    "not happy":                               "1202650445593181",
+    # "Customer Changed their Mind"
     "customer changed their mind":             "1202675156630741",
+    "changed my mind":                         "1202675156630741",
+    "changed their mind":                      "1202675156630741",
+    # "Sent wrong pair of Shoes/Bag"
     "sent wrong pair of shoes/bag":            "1202956846480528",
+    "wrong item":                              "1202956846480528",
+    # "Customer does not want any color change"
     "customer does not want any color change": "1203147939016011",
+    "no color change":                         "1203147939016011",
+    # "Donation"
     "donation":                                "1206664031863519",
+    # "Transfer to Finery"
     "transfer to finery":                      "1207355056904088",
+    # "Item not processed"
     "item not processed":                      "1207459611389499",
 }
 
