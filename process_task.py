@@ -51,8 +51,10 @@ DUBAI_TZ = timezone(timedelta(hours=4))
 # defend against runaway / hostile responses that could OOM the worker.
 MAX_PHOTO_BYTES = 25 * 1024 * 1024
 
-# Custom field GID
-PRICE_FIELD_GID = "1202480206903933"
+# Custom field GIDs
+PRICE_FIELD_GID            = "1202480206903933"
+ASSESSMENT_FIELD_GID       = "1213817197288597"
+ASSESSMENT_DONE_OPTION_GID = "1213817197288598"
 
 # Approval URLs from both the Lovable preview and the Washmen production domain
 LINK_PATTERNS = [
@@ -543,6 +545,16 @@ def process_task(task_id: str) -> None:
         return
     print(f"Link: {link}")
     print(f"Shoe: {shoe_id}")
+
+    # Mark Assessment "Done" as soon as we see the Lovable link. Runs before
+    # the Supabase fetch so it executes even when the snapshot isn't visible
+    # yet (Lovable write-order race). Failure here is non-fatal — the rest of
+    # the pipeline continues and a future process_task run will retry.
+    try:
+        update_task(task_id, {"custom_fields": {ASSESSMENT_FIELD_GID: ASSESSMENT_DONE_OPTION_GID}})
+        print("  Assessment: marked Done")
+    except Exception as e:
+        print(f"  Assessment: update failed ({e}); continuing")
 
     # 3. Fetch from Supabase
     print("Fetching shoe data from Supabase...")
