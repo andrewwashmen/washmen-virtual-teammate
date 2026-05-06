@@ -438,6 +438,10 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
     if current_data["is_rejected"]:
         payload["custom_fields"] = {pt.PRICE_FIELD_GID: None}
         payload["due_on"]        = None
+        # Mirror the rejection reason into the right custom field. Same router
+        # used by process_task — facility rejections go to Internal Rejection
+        # Reason, customer rejections to Reason for Rejection.
+        pt.apply_rejection_reason_field(payload, current_data)
     else:
         if current_data["total_price"] is not None:
             payload["custom_fields"] = {pt.PRICE_FIELD_GID: current_data["total_price"]}

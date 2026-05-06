@@ -52,26 +52,41 @@ DUBAI_TZ = timezone(timedelta(hours=4))
 MAX_PHOTO_BYTES = 25 * 1024 * 1024
 
 # Custom field GIDs
-PRICE_FIELD_GID                = "1202480206903933"
-ASSESSMENT_FIELD_GID           = "1213817197288597"
-ASSESSMENT_DONE_OPTION_GID     = "1213817197288598"
-REASON_FOR_REJECTION_FIELD_GID = "1202637830332848"
+PRICE_FIELD_GID                    = "1202480206903933"
+ASSESSMENT_FIELD_GID               = "1213817197288597"
+ASSESSMENT_DONE_OPTION_GID         = "1213817197288598"
+REASON_FOR_REJECTION_FIELD_GID     = "1202637830332848"  # multi_enum
+INTERNAL_REJECTION_REASON_FIELD_GID = "1214569192694597"  # enum (single)
 
-# Lovable's rejection_reason string (from the Supabase snapshot) → Asana option
-# GID for the multi-enum "Reason for Rejection:" field. Matched case-insensitive
-# with whitespace stripped. Unrecognized reasons are logged and skipped — the
-# field stays empty, the rest of the rejection pipeline proceeds normally.
+# Customer-facing rejection reasons → Asana option GIDs for the multi_enum
+# "Reason for Rejection:" field. Used when source='customer' (the customer
+# rejected via the Wizard). Matched case-insensitive with whitespace stripped.
 REJECTION_REASON_OPTIONS = {
     "pricing":                                 "1202637830332849",
     "turn around time":                        "1202637830332850",
     "repair service not available":            "1202637830332851",
     "replacement items not available":         "1202637830332852",
+    "customer is not happy":                   "1202650445593181",
     "customer changed their mind":             "1202675156630741",
     "sent wrong pair of shoes/bag":            "1202956846480528",
     "customer does not want any color change": "1203147939016011",
     "donation":                                "1206664031863519",
     "transfer to finery":                      "1207355056904088",
     "item not processed":                      "1207459611389499",
+}
+
+# Internal (facility-driven) rejection reasons → Asana option GID for the
+# single-enum "Internal Rejection Reason" field. Used when source='facility'
+# (a Washmen operator rejected on the customer's behalf — typically because
+# the item couldn't be serviced). Matched case-insensitive with whitespace
+# stripped. Unrecognized reasons log and skip; field stays empty.
+INTERNAL_REJECTION_REASON_OPTIONS = {
+    "transfer to finery":                          "1214569192694598",
+    "weak material":                               "1214568232531707",
+    "service not available":                       "1214568232531708",
+    "structural integrity issues":                 "1214568232531709",
+    "prior failed restoration/ modification risks": "1214568232531710",
+    "prior failed restoration/modification risks":  "1214568232531710",  # without space
 }
 
 # Approval URLs from both the Lovable preview and the Washmen production domain
@@ -455,6 +470,11 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
         "rejection_reason":  snapshot.get("rejection_reason") if is_rejected else None,
         "rejector_name":     approver_label                             if is_rejected else None,
         "rejected_at":       _format_supabase_timestamp(approved_at)    if is_rejected else None,
+        # Raw lowercase source used to route rejection reason to the right
+        # custom field (`facility` → Internal Rejection Reason, else → Reason
+        # for Rejection). Set for both approved and rejected so callers don't
+        # have to special-case.
+        "rejector_source":   (snapshot.get("source") or "").lower()     if is_rejected else None,
         "approver_name":     approver_label                             if not is_rejected else None,
         "approver_time":     _format_supabase_timestamp(approved_at)    if not is_rejected else None,
         "approver_type":     source_label                               if not is_rejected else None,
@@ -536,6 +556,46 @@ def _attach_photos(task_id: str, photos: list[str], name_prefix: str) -> int:
         except Exception as e:
             print(f"    failed to attach {filename}: {e}")
     return success
+
+
+# ---------------------------------------------------------------------------
+# Rejection-reason field routing
+# ---------------------------------------------------------------------------
+
+def apply_rejection_reason_field(task_update: dict, data: dict) -> None:
+    """Set the appropriate rejection-reason custom field on a task_update payload.
+
+    Routes based on `data["rejector_source"]`:
+      - "facility" → single-enum "Internal Rejection Reason" (us rejecting on
+        the customer's behalf — typically because the item can't be serviced)
+      - anything else (including "customer") → multi-enum "Reason for Rejection:"
+        (the customer rejected via the Wizard)
+
+    Mutates `task_update["custom_fields"]` in place. Unrecognized reason strings
+    are logged and skipped — the field stays empty rather than guessing wrong.
+    """
+    rj = (data.get("rejection_reason") or "").strip().lower()
+    if not rj:
+        return
+
+    custom_fields = task_update.setdefault("custom_fields", {})
+
+    if data.get("rejector_source") == "facility":
+        opt = INTERNAL_REJECTION_REASON_OPTIONS.get(rj)
+        if opt:
+            custom_fields[INTERNAL_REJECTION_REASON_FIELD_GID] = opt
+            print(f"  Internal Rejection Reason: {data['rejection_reason']}")
+        else:
+            print(f"  Internal Rejection Reason: unrecognized "
+                  f"{data['rejection_reason']!r}; field left empty")
+    else:
+        opt = REJECTION_REASON_OPTIONS.get(rj)
+        if opt:
+            custom_fields[REASON_FOR_REJECTION_FIELD_GID] = [opt]
+            print(f"  Reason for Rejection: {data['rejection_reason']}")
+        else:
+            print(f"  Reason for Rejection: unrecognized "
+                  f"{data['rejection_reason']!r}; field left empty")
 
 
 # ---------------------------------------------------------------------------
@@ -697,17 +757,7 @@ def process_task(task_id: str) -> None:
     if data["is_rejected"]:
         task_update["custom_fields"] = {PRICE_FIELD_GID: None}
         task_update["due_on"]        = None
-        # Mirror the customer's rejection reason into the Asana custom field.
-        # The field is multi_enum, so values go in a list. Unrecognized reason
-        # strings are logged and skipped (field stays empty rather than
-        # surfacing a misleading mapping).
-        rj = (data.get("rejection_reason") or "").strip().lower()
-        rj_option = REJECTION_REASON_OPTIONS.get(rj)
-        if rj_option:
-            task_update["custom_fields"][REASON_FOR_REJECTION_FIELD_GID] = [rj_option]
-            print(f"  Reason for Rejection: {data['rejection_reason']}")
-        elif rj:
-            print(f"  Reason for Rejection: unrecognized {data['rejection_reason']!r}; field left empty")
+        apply_rejection_reason_field(task_update, data)
     else:
         if data["total_price"] is not None:
             task_update["custom_fields"] = {PRICE_FIELD_GID: data["total_price"]}
