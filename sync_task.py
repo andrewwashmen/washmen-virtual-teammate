@@ -443,8 +443,15 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
         # Reason, customer rejections to Reason for Rejection.
         pt.apply_rejection_reason_field(payload, current_data)
     else:
+        # Approved: clear any prior rejection-field values (in case this task
+        # was previously rejected and the customer has now overturned), and
+        # set price + due_on from the approved snapshot.
+        payload["custom_fields"] = {
+            pt.REASON_FOR_REJECTION_FIELD_GID:      [],
+            pt.INTERNAL_REJECTION_REASON_FIELD_GID: None,
+        }
         if current_data["total_price"] is not None:
-            payload["custom_fields"] = {pt.PRICE_FIELD_GID: current_data["total_price"]}
+            payload["custom_fields"][pt.PRICE_FIELD_GID] = current_data["total_price"]
         approved = _approved_date_dubai(current_snap)
         tat = current_data["total_tat"]
         if approved and tat:
@@ -470,9 +477,11 @@ def sync_task(task_id: str, dry_run: bool = False) -> None:
     task  = pt.get_task(task_id)
     notes = task.get("notes") or ""
 
-    # Eligibility
-    if "Approved by customer" not in notes:
-        print("Not approved (or not yet processed). Skipping.")
+    # Eligibility — sync handles both Approved and Rejected states; we react
+    # to whichever marker the description currently has and detect transitions
+    # via Supabase decision. Older tasks (no marker yet) are still skipped.
+    if "Approved by customer" not in notes and "Rejected by customer" not in notes:
+        print("Not yet processed (no Approved/Rejected marker). Skipping.")
         return
     link = pt.find_link(notes)
     if not link:
@@ -501,6 +510,15 @@ def sync_task(task_id: str, dry_run: bool = False) -> None:
     print(f"Current key: {current_key}")
     snapshot_changed = current_key != stored["raw"]
 
+    # Detect approved↔rejected flip independently of the snapshot key — defensive
+    # against the case where Lovable changes decision without bumping version.
+    old_was_rejected = "Rejected by customer" in notes
+    new_is_rejected  = (current_snap.get("decision") or "") == "rejected"
+    decision_changed = old_was_rejected != new_is_rejected
+    if decision_changed:
+        flip = "Rejected -> Approved" if old_was_rejected else "Approved -> Rejected"
+        print(f"Decision flipped: {flip}")
+
     # Internal notes aren't part of the snapshot key (Supabase RLS hides the
     # table from anon, and we'd need a Jina scrape per cycle to hash them).
     # Instead, scrape now and compare against what's in the description.
@@ -514,7 +532,7 @@ def sync_task(task_id: str, dry_run: bool = False) -> None:
     if internal_summary:
         print(f"Internal notes: {internal_summary} ({len(prev_internal)} -> {len(current_internal)})")
 
-    if not snapshot_changed and not internal_summary:
+    if not snapshot_changed and not internal_summary and not decision_changed:
         print("No changes detected.")
         return
 
@@ -536,10 +554,18 @@ def sync_task(task_id: str, dry_run: bool = False) -> None:
 
     current_data = pt.build_data(shoe_data, current_internal)
 
-    # Apply state syncs (only the parts that changed)
-    if snapshot_changed:
-        sync_subtasks(task_id, current_data["approved_services"], dry_run)
-        sync_service_photos(task_id, current_data["approved_services"], dry_run)
+    # Apply state syncs. Rejected tasks have no subtasks and no per-service
+    # photos (matching process_task's initial-rejection rules). Approved tasks
+    # have both. We trigger this block on snapshot_changed OR decision_changed
+    # so a pure flip without a version bump still re-syncs cleanly.
+    if snapshot_changed or decision_changed:
+        if current_data["is_rejected"]:
+            # Wipe subtasks; per-service photos left as orphans (cheap to leave,
+            # avoids re-uploading on a future flip back to approved).
+            sync_subtasks(task_id, [], dry_run)
+        else:
+            sync_subtasks(task_id, current_data["approved_services"], dry_run)
+            sync_service_photos(task_id, current_data["approved_services"], dry_run)
         if dmg_diff["added"] or dmg_diff["removed_count"] or dmg_diff["updated"]:
             sync_stains(task_id, current_data["damage_entries"], current_data["stains_photos"], dry_run)
     # Description rewrite always runs (picks up notes change, refreshes Snapshot key)

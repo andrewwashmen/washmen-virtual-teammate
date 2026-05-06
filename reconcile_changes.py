@@ -18,7 +18,9 @@ cron service from render.yaml.
 
 Eligibility filter:
   - Task is in the ShoeCare board, not completed
-  - Notes contain `Approved by customer` (skip rejected per design Q2)
+  - Notes contain `Approved by customer` OR `Rejected by customer`
+    (sync_task handles flips in both directions, including overturning
+    rejections — there's no terminal state on the bot's side)
   - Notes contain `Snapshot key:` line (baseline to compare against)
   - modified_at within last 7 days (don't reach back forever)
 
@@ -57,7 +59,7 @@ def list_eligible_tasks() -> list[dict]:
     """
     cutoff = (datetime.now(timezone.utc) - LOOKBACK_WINDOW).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     eligible: list[dict] = []
-    skipped: dict[str, int] = {"not_approved": 0, "no_snapshot_key": 0}
+    skipped: dict[str, int] = {"not_processed": 0, "no_snapshot_key": 0}
 
     offset: str | None = None
     while True:
@@ -83,8 +85,9 @@ def list_eligible_tasks() -> list[dict]:
 
         for task in body.get("data", []):
             notes = task.get("notes") or ""
-            if "Approved by customer" not in notes:
-                skipped["not_approved"] += 1
+            if ("Approved by customer" not in notes
+                    and "Rejected by customer" not in notes):
+                skipped["not_processed"] += 1
                 continue
             if "Snapshot key:" not in notes:
                 skipped["no_snapshot_key"] += 1

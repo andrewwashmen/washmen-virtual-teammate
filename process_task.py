@@ -595,31 +595,39 @@ def apply_rejection_reason_field(task_update: dict, data: dict) -> None:
       - anything else (including "customer") → multi-enum "Reason for Rejection:"
         (the customer rejected via the Wizard)
 
-    Mutates `task_update["custom_fields"]` in place. Unrecognized reason strings
-    are logged and skipped — the field stays empty rather than guessing wrong.
+    Always clears the *opposite* field so a flip between customer↔facility
+    sources never leaves a stale value behind. Unrecognized reason strings
+    are logged and the matching field is cleared rather than guessing wrong.
+
+    Mutates `task_update["custom_fields"]` in place.
     """
     rj = (data.get("rejection_reason") or "").strip().lower()
-    if not rj:
-        return
-
     custom_fields = task_update.setdefault("custom_fields", {})
 
     if data.get("rejector_source") == "facility":
-        opt = INTERNAL_REJECTION_REASON_OPTIONS.get(rj)
+        # Facility rejection: clear customer-facing field, set internal field.
+        custom_fields[REASON_FOR_REJECTION_FIELD_GID] = []
+        opt = INTERNAL_REJECTION_REASON_OPTIONS.get(rj) if rj else None
         if opt:
             custom_fields[INTERNAL_REJECTION_REASON_FIELD_GID] = opt
             print(f"  Internal Rejection Reason: {data['rejection_reason']}")
         else:
-            print(f"  Internal Rejection Reason: unrecognized "
-                  f"{data['rejection_reason']!r}; field left empty")
+            custom_fields[INTERNAL_REJECTION_REASON_FIELD_GID] = None
+            if rj:
+                print(f"  Internal Rejection Reason: unrecognized "
+                      f"{data['rejection_reason']!r}; field left empty")
     else:
-        opt = REJECTION_REASON_OPTIONS.get(rj)
+        # Customer rejection: clear internal field, set customer-facing field.
+        custom_fields[INTERNAL_REJECTION_REASON_FIELD_GID] = None
+        opt = REJECTION_REASON_OPTIONS.get(rj) if rj else None
         if opt:
             custom_fields[REASON_FOR_REJECTION_FIELD_GID] = [opt]
             print(f"  Reason for Rejection: {data['rejection_reason']}")
         else:
-            print(f"  Reason for Rejection: unrecognized "
-                  f"{data['rejection_reason']!r}; field left empty")
+            custom_fields[REASON_FOR_REJECTION_FIELD_GID] = []
+            if rj:
+                print(f"  Reason for Rejection: unrecognized "
+                      f"{data['rejection_reason']!r}; field left empty")
 
 
 # ---------------------------------------------------------------------------
