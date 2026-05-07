@@ -23,6 +23,8 @@ import os
 import threading
 import logging
 import requests
+from collections import defaultdict
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -57,6 +59,52 @@ _IN_FLIGHT_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
+# In-process metrics
+# ---------------------------------------------------------------------------
+# Lightweight counters exposed via GET /metrics. Process-local — they reset
+# whenever Render restarts the worker, and reflect only the web service's
+# observed activity (reconcilers run in separate processes and report via
+# their own log lines). Use as a quick health snapshot, not as an SLO source.
+
+_METRICS_LOCK = threading.Lock()
+_METRICS: dict = {
+    "started_at":             datetime.now(timezone.utc).isoformat(),
+    "events_received_total":  0,
+    "events_by_action":       defaultdict(int),
+    "tasks_processed_total":  0,
+    "tasks_failed_total":     0,
+    "syncs_processed_total":  0,
+    "syncs_failed_total":     0,
+    "last_event_at":          None,
+    "last_error_at":          None,
+    "last_error_context":     None,
+    "last_error_message":     None,
+}
+
+
+def _bump(key: str, n: int = 1) -> None:
+    with _METRICS_LOCK:
+        _METRICS[key] = _METRICS.get(key, 0) + n
+
+
+def _bump_action(action: str) -> None:
+    with _METRICS_LOCK:
+        _METRICS["events_by_action"][action] += 1
+
+
+def _record_error(context: str, exc: Exception) -> None:
+    with _METRICS_LOCK:
+        _METRICS["last_error_at"]      = datetime.now(timezone.utc).isoformat()
+        _METRICS["last_error_context"] = context
+        _METRICS["last_error_message"] = f"{type(exc).__name__}: {exc}"[:300]
+
+
+def _stamp_event() -> None:
+    with _METRICS_LOCK:
+        _METRICS["last_event_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
 
@@ -87,10 +135,13 @@ def handle_task_change(task_id: str) -> None:
         log.info("Task %s — link found, running automation …", task_id)
         process_task(task_id)
         log.info("Task %s — automation complete.", task_id)
+        _bump("tasks_processed_total")
 
     except Exception as exc:
         log.error("Error processing task %s: %s", task_id, exc, exc_info=True)
         notify_error(task_id, exc, CTX_INITIAL, task_name=(task or {}).get("name"))
+        _bump("tasks_failed_total")
+        _record_error(CTX_INITIAL, exc)
     finally:
         with _IN_FLIGHT_LOCK:
             _IN_FLIGHT.discard(task_id)
@@ -134,6 +185,7 @@ def handle_story_added(task_id: str, story_id: str) -> None:
         log.info("Task %s — Lovable signal detected, running sync_task …", task_id)
         sync_task(task_id, dry_run=False)
         log.info("Task %s — sync complete.", task_id)
+        _bump("syncs_processed_total")
 
     except Exception as exc:
         log.error("Error syncing task %s after story event: %s", task_id, exc, exc_info=True)
@@ -142,6 +194,8 @@ def handle_story_added(task_id: str, story_id: str) -> None:
         except Exception:
             task_name = None
         notify_error(task_id, exc, CTX_CHANGE, task_name=task_name)
+        _bump("syncs_failed_total")
+        _record_error(CTX_CHANGE, exc)
     finally:
         with _IN_FLIGHT_LOCK:
             _IN_FLIGHT.discard(task_id)
@@ -163,6 +217,9 @@ def webhook():
     # ── Event processing ─────────────────────────────────────────────────────
     payload = request.get_json(silent=True) or {}
     events  = payload.get("events", [])
+    if events:
+        _bump("events_received_total", len(events))
+        _stamp_event()
 
     queued_tasks = set()
     queued_stories = set()
@@ -174,6 +231,7 @@ def webhook():
 
         # Initial Lovable post: link appears in the task notes → process_task
         if rtype == "task" and action == "changed" and change.get("field") == "notes":
+            _bump_action("task_changed_notes")
             task_id = resource.get("gid")
             if task_id and task_id not in queued_tasks:
                 queued_tasks.add(task_id)
@@ -187,6 +245,7 @@ def webhook():
         # Subsequent Lovable saves: an `Approval link:` comment is added to
         # the task → sync_task to pick up the new snapshot/damages/notes
         elif rtype == "story" and action == "added" and resource.get("resource_subtype") == "comment_added":
+            _bump_action("story_added")
             story_id = resource.get("gid")
             parent   = event.get("parent") or {}
             task_id  = parent.get("gid") if parent.get("resource_type") == "task" else None
@@ -198,6 +257,8 @@ def webhook():
                     args=(task_id, story_id),
                     daemon=True,
                 ).start()
+        else:
+            _bump_action("ignored")
 
     return jsonify({
         "status":  "ok",
@@ -210,6 +271,42 @@ def webhook():
 def health():
     """Render and other PaaS hosts hit this to verify the service is up."""
     return jsonify({"status": "healthy"}), 200
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """Process-local counters for the web service. Resets on Render restart.
+
+    Reflects only what this worker has observed — reconcilers run in separate
+    processes (washmen-virtual-teammate-reconciler / -sync-reconciler) and
+    log their own summaries. Use as a quick health snapshot, not an SLO source.
+    """
+    now = datetime.now(timezone.utc)
+    with _METRICS_LOCK:
+        started_at = _METRICS["started_at"]
+        try:
+            started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            uptime_seconds = int((now - started_dt).total_seconds())
+        except Exception:
+            uptime_seconds = None
+        snapshot = {
+            "started_at":             started_at,
+            "uptime_seconds":         uptime_seconds,
+            "events_received_total":  _METRICS["events_received_total"],
+            "events_by_action":       dict(_METRICS["events_by_action"]),
+            "tasks_processed_total":  _METRICS["tasks_processed_total"],
+            "tasks_failed_total":     _METRICS["tasks_failed_total"],
+            "syncs_processed_total":  _METRICS["syncs_processed_total"],
+            "syncs_failed_total":     _METRICS["syncs_failed_total"],
+            "last_event_at":          _METRICS["last_event_at"],
+            "last_error_at":          _METRICS["last_error_at"],
+            "last_error_context":     _METRICS["last_error_context"],
+            "last_error_message":     _METRICS["last_error_message"],
+        }
+    # Read this outside the metrics lock — it has its own.
+    with _IN_FLIGHT_LOCK:
+        snapshot["in_flight_count"] = len(_IN_FLIGHT)
+    return jsonify(snapshot), 200
 
 
 # ---------------------------------------------------------------------------
