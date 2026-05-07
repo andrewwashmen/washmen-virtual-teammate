@@ -483,6 +483,14 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
     if service_field_payload:
         payload.setdefault("custom_fields", {}).update(service_field_payload)
 
+    # Re-derive Service Type from the current description on every sync. The
+    # initial process_task set it from the description at the time of the
+    # first link; if the description has since changed (e.g. an operator
+    # added/changed the size), this keeps the field in lockstep.
+    payload.setdefault("custom_fields", {}).update(
+        pt.derive_service_type_payload(notes)
+    )
+
     print(f"  update description + custom fields"
           + (f" (due {due_was} -> {due_now})" if due_now and due_now != due_was else ""))
     if not dry_run:

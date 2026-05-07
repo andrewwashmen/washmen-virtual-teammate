@@ -817,6 +817,31 @@ def _field_gid_by_name(field_name: str) -> Optional[str]:
     return _FIELD_NAME_CACHE.get((field_name or "").strip().lower())
 
 
+def derive_service_type_payload(notes: str) -> dict:
+    """Return a custom_fields payload setting Service Type from the description.
+
+    `BagCare` when the description marks `Size: Check Attachments` (the
+    Wizard's signal for items needing manual sizing — bag flow), else
+    `ShoeCare`. Returns `{}` if the field or option isn't discoverable in
+    the project so callers can merge unconditionally.
+
+    Used in two places: process_task's early-update (on the initial Lovable
+    link) and sync_task's task_update (so re-posted scope changes that flip
+    item type land in Asana).
+    """
+    label = "BagCare" if "Size: Check Attachments" in (notes or "") else "ShoeCare"
+    field_gid = _field_gid_by_name("Service Type")
+    if not field_gid:
+        print("  Service Type: field not found in project; skipping")
+        return {}
+    option_gid = _option_gid(field_gid, label)
+    if not option_gid:
+        print(f"  Service Type: option {label!r} not found; skipping")
+        return {}
+    print(f"  Service Type: {label}")
+    return {field_gid: option_gid}
+
+
 def _current_multi_enum_gids(current_custom_fields: list, field_gid: str) -> set[str]:
     """Pull the current set of multi_enum option GIDs from a get_task payload."""
     out: set[str] = set()
@@ -938,22 +963,25 @@ def compute_service_field_mappings(data: dict, current_custom_fields: list) -> d
         payload[RECOMMENDED_REPAIR_FIELD_GID] = list(new_rec_repair)
     # No write when nothing new → existing values preserved.
 
-    # ─── Approved-derived: Express Item (set-only, never clear) ────────────
+    # ─── Approved-derived: Express Item (full overwrite) ───────────────────
     # Lovable tags express services by suffixing `Express` to the service
-    # name. `build_data` strips that and surfaces an `is_express` flag.
-    # When set, we flip Express Item to "Yes". We don't write "No" or clear
-    # the field on the negative path so manual operator toggles aren't
-    # clobbered on the next sync.
-    if data.get("is_express"):
-        express_field_gid = _field_gid_by_name("Express Item")
-        if express_field_gid:
+    # name; `build_data` strips that and surfaces an `is_express` flag.
+    # When true we set Express Item to "Yes"; when false (no Express in
+    # current scope, or the order was rejected entirely) we clear the field
+    # so it tracks the latest customer state. Same overwrite-on-every-run
+    # semantics as Basic Cleaning / Restoration / Repair / Bundle above.
+    express_field_gid = _field_gid_by_name("Express Item")
+    if express_field_gid:
+        if data.get("is_express"):
             yes_gid = _option_gid(express_field_gid, "Yes")
             if yes_gid:
                 payload[express_field_gid] = yes_gid
             else:
                 print("  Express Item: option 'Yes' not found; skipping")
         else:
-            print("  Express Item: field not found in project; skipping")
+            payload[express_field_gid] = None
+    else:
+        print("  Express Item: field not found in project; skipping")
 
     return payload
 
@@ -985,29 +1013,16 @@ def process_task(task_id: str) -> None:
     print(f"Shoe: {shoe_id}")
 
     # Mark Assessment "Done" and set Service Type as soon as we see the
-    # Lovable link. Both are derivable from the description alone (no Supabase
-    # fetch needed), so they run before the Supabase fetch — that way they
-    # land even when the snapshot isn't visible yet (Lovable write-order
-    # race). Service Type is BagCare when the description explicitly says
-    # `Size: Check Attachments` (bag flow), else ShoeCare. Failure here is
-    # non-fatal — the rest of the pipeline continues and a future
-    # process_task run will retry.
+    # Lovable link. Both are derivable from the description alone (no
+    # Supabase fetch needed), so they run before the Supabase fetch — that
+    # way they land even when the snapshot isn't visible yet (Lovable
+    # write-order race). Failure here is non-fatal — the rest of the
+    # pipeline continues and a future process_task run will retry.
     early_fields: dict = {ASSESSMENT_FIELD_GID: ASSESSMENT_DONE_OPTION_GID}
-    service_type_label = "BagCare" if "Size: Check Attachments" in notes else "ShoeCare"
-    service_type_field_gid = _field_gid_by_name("Service Type")
-    if service_type_field_gid:
-        st_option_gid = _option_gid(service_type_field_gid, service_type_label)
-        if st_option_gid:
-            early_fields[service_type_field_gid] = st_option_gid
-        else:
-            print(f"  Service Type: option {service_type_label!r} not found; skipping")
-    else:
-        print("  Service Type: field not found in project; skipping")
+    early_fields.update(derive_service_type_payload(notes))
     try:
         update_task(task_id, {"custom_fields": early_fields})
         print("  Assessment: marked Done")
-        if service_type_field_gid in early_fields:
-            print(f"  Service Type: {service_type_label}")
     except Exception as e:
         print(f"  Assessment / Service Type: update failed ({e}); continuing")
 
