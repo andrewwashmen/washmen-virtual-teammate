@@ -274,6 +274,25 @@ def sync_subtasks(task_id: str, current_services: list[dict], dry_run: bool) -> 
     Q14: changes happen pre-work, so deletion is safe (no progress lost).
     """
     existing = pt.list_subtasks(task_id)
+
+    # Migration: subtasks created by older builds may carry the literal word
+    # `Express` (e.g. `Premium Cleaning Express`). Current builds strip that
+    # so without an in-place rename, the diff below would see the old name
+    # as "removed" and lose subtask state on delete+recreate. Rename is
+    # idempotent — clean names short-circuit through `_strip_express`'s
+    # no-op path. We also update the in-memory `sub["name"]` so the
+    # subsequent diff (and dry-run preview) sees the post-rename state.
+    for sub in existing:
+        cur_name = (sub.get("name") or "").strip()
+        if not cur_name:
+            continue
+        clean, was_express = pt._strip_express(cur_name)
+        if was_express and clean and clean != cur_name:
+            print(f"  ~ rename subtask: {cur_name!r} -> {clean!r}")
+            if not dry_run:
+                pt.update_task(sub["gid"], {"name": clean})
+            sub["name"] = clean
+
     by_name_lc = {(s.get("name") or "").strip().lower(): s for s in existing}
     current_names_lc = {s["name"].strip().lower() for s in current_services if s.get("name")}
 

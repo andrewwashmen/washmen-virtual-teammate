@@ -128,6 +128,13 @@ LINK_PATTERNS = [
 ]
 SHOE_ID_RE = re.compile(r"/approved/([a-f0-9\-]{36})")
 
+# Lovable tags express-handling services by appending the word "Express" to
+# the service name (e.g. "Premium Cleaning Express"). We strip it from the
+# name so subtasks and the existing Basic Cleaning / Restoration / Repair /
+# Bundle mappings still match, and surface a separate `is_express` flag that
+# drives the Express Item custom field.
+_EXPRESS_RE = re.compile(r"\bexpress\b", re.IGNORECASE)
+
 # Cache for the Supabase config (URL + anon key). Both are discovered from
 # the SPA's JS bundle. The anon key is public — every browser visiting
 # sc.washmen.com receives it — so caching it isn't a leak. RLS on the
@@ -447,6 +454,19 @@ def compute_snapshot_key(snapshot: dict, damages: list[dict]) -> str:
     return f"v{version} | dmg=" + ",".join(sigs)
 
 
+def _strip_express(name: str) -> tuple[str, bool]:
+    """Strip the word `Express` from a service name (whole word, any case).
+
+    Returns `(cleaned_name, was_express)`. `Premium Cleaning Express` →
+    `("Premium Cleaning", True)`. Whitespace is collapsed after stripping so
+    we don't leave a double-space behind.
+    """
+    cleaned, n = _EXPRESS_RE.subn("", name or "")
+    if n == 0:
+        return name or "", False
+    return re.sub(r"\s+", " ", cleaned).strip(), True
+
+
 def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
     """Assemble the unified data dict from Supabase rows + Jina internal notes."""
     snapshot = shoe_data.get("snapshot")
@@ -461,10 +481,19 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
     # orders) or the proposed set the customer rejected (for rejected orders).
     # Services the customer removed from scope simply aren't present in this
     # array, so there's no per-row removed flag.
+    #
+    # `Express` is stripped from each name here so all downstream consumers
+    # (subtask creation, photo comments, custom-field mappings, description
+    # text) see clean names. The `is_express` flag below captures whether
+    # any approved service carried the marker.
     services = []
+    is_express = False
     for s in snapshot.get("services") or []:
+        clean_name, was_express = _strip_express(s.get("name") or "")
+        if was_express:
+            is_express = True
         services.append({
-            "name":     s.get("name") or "",
+            "name":     clean_name,
             "tat_days": s.get("final_commitment_days") or s.get("tat"),
             "price":    float(s.get("price") or 0),
             "photos":   list(s.get("photos") or []),
@@ -494,7 +523,14 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
     # scope, so when empty, the final `services` list IS the operator's
     # recommendation (page mirrors this fallback).
     sorter_source     = snapshot.get("operator_services_at_send") or snapshot.get("services") or []
-    sorter_suggested  = [s.get("name") for s in sorter_source if s.get("name")]
+    sorter_suggested: list[str] = []
+    for s in sorter_source:
+        n = s.get("name")
+        if not n:
+            continue
+        clean, _ = _strip_express(n)
+        if clean:
+            sorter_suggested.append(clean)
 
     return {
         "has_snapshot":      True,
@@ -511,6 +547,7 @@ def build_data(shoe_data: dict, internal_entries: list[str]) -> dict:
         "approver_time":     _format_supabase_timestamp(approved_at)    if not is_rejected else None,
         "approver_type":     source_label                               if not is_rejected else None,
         "approved_services": services,
+        "is_express":        is_express,
         "total_tat":         snapshot.get("final_commitment_days"),
         "total_price":       snapshot.get("total_price"),
         "stains_entries":    [e["note"] for e in damage_entries if e["note"]],
@@ -900,6 +937,23 @@ def compute_service_field_mappings(data: dict, current_custom_fields: list) -> d
     if new_rec_repair != current_rec_repair:
         payload[RECOMMENDED_REPAIR_FIELD_GID] = list(new_rec_repair)
     # No write when nothing new → existing values preserved.
+
+    # ─── Approved-derived: Express Item (set-only, never clear) ────────────
+    # Lovable tags express services by suffixing `Express` to the service
+    # name. `build_data` strips that and surfaces an `is_express` flag.
+    # When set, we flip Express Item to "Yes". We don't write "No" or clear
+    # the field on the negative path so manual operator toggles aren't
+    # clobbered on the next sync.
+    if data.get("is_express"):
+        express_field_gid = _field_gid_by_name("Express Item")
+        if express_field_gid:
+            yes_gid = _option_gid(express_field_gid, "Yes")
+            if yes_gid:
+                payload[express_field_gid] = yes_gid
+            else:
+                print("  Express Item: option 'Yes' not found; skipping")
+        else:
+            print("  Express Item: field not found in project; skipping")
 
     return payload
 
