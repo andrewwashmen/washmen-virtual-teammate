@@ -56,3 +56,21 @@ services:
         value: "1202289964354061"
       - key: SLACK_WEBHOOK_URL
         sync: false
+
+  # Daily metrics: once a day at 00:00 UTC, fetches the web service's
+  # /metrics endpoint and posts a formatted summary to the same Slack
+  # channel that receives error alerts. Counters are process-local to the
+  # web worker and reset on Render restarts — treat numbers as a quick
+  # health snapshot, not a strict 24h window.
+  - type: cron
+    name: washmen-virtual-teammate-daily-metrics
+    runtime: python
+    plan: starter
+    schedule: "0 0 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python daily_metrics_report.py
+    envVars:
+      - key: METRICS_URL
+        value: "https://washmen-virtual-teammate.onrender.com/metrics"
+      - key: SLACK_WEBHOOK_URL
+        sync: false
