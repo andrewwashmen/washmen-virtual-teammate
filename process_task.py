@@ -716,11 +716,13 @@ SUGGESTION_TO_RECOMMENDED_REPAIR_OPTION: dict[str, str] = SUBTASK_TO_REPAIR_OPTI
 # Cache: {field_gid: {option_name_lower: option_gid}}. Populated on first call
 # to _option_gid() per process. Reset on process restart (Render redeploy).
 _OPTION_LOOKUP_CACHE: Optional[dict[str, dict[str, str]]] = None
+# Cache: {field_name_lower: field_gid}. Populated alongside the option lookup.
+_FIELD_NAME_CACHE: Optional[dict[str, str]] = None
 
 
 def _build_option_lookup() -> dict[str, dict[str, str]]:
-    """Discover all enum option GIDs on the project. Cached for the worker."""
-    global _OPTION_LOOKUP_CACHE
+    """Discover enum option GIDs and field GIDs on the project. Cached for the worker."""
+    global _OPTION_LOOKUP_CACHE, _FIELD_NAME_CACHE
     if _OPTION_LOOKUP_CACHE is not None:
         return _OPTION_LOOKUP_CACHE
 
@@ -730,7 +732,7 @@ def _build_option_lookup() -> dict[str, dict[str, str]]:
             f"{ASANA_BASE}/projects/{project_gid}/custom_field_settings",
             headers=_asana_headers(),
             params={
-                "opt_fields": "custom_field.gid,custom_field.enum_options.gid,custom_field.enum_options.name",
+                "opt_fields": "custom_field.gid,custom_field.name,custom_field.enum_options.gid,custom_field.enum_options.name",
                 "limit":      100,
             },
             timeout=15,
@@ -742,11 +744,15 @@ def _build_option_lookup() -> dict[str, dict[str, str]]:
         return {}
 
     lookup: dict[str, dict[str, str]] = {}
+    name_lookup: dict[str, str] = {}
     for setting in r.json().get("data", []):
         cf = setting.get("custom_field") or {}
         field_gid = cf.get("gid")
         if not field_gid:
             continue
+        name = (cf.get("name") or "").strip().lower()
+        if name:
+            name_lookup[name] = field_gid
         options = cf.get("enum_options") or []
         lookup[field_gid] = {
             (o.get("name") or "").strip().lower(): o.get("gid")
@@ -755,6 +761,7 @@ def _build_option_lookup() -> dict[str, dict[str, str]]:
         }
 
     _OPTION_LOOKUP_CACHE = lookup
+    _FIELD_NAME_CACHE = name_lookup
     return lookup
 
 
@@ -763,6 +770,14 @@ def _option_gid(field_gid: str, option_label: str) -> Optional[str]:
     lookup = _build_option_lookup()
     field_options = lookup.get(field_gid) or {}
     return field_options.get((option_label or "").strip().lower())
+
+
+def _field_gid_by_name(field_name: str) -> Optional[str]:
+    """Look up a custom field's GID by its display name (case-insensitive)."""
+    _build_option_lookup()
+    if _FIELD_NAME_CACHE is None:
+        return None
+    return _FIELD_NAME_CACHE.get((field_name or "").strip().lower())
 
 
 def _current_multi_enum_gids(current_custom_fields: list, field_gid: str) -> set[str]:
@@ -915,15 +930,32 @@ def process_task(task_id: str) -> None:
     print(f"Link: {link}")
     print(f"Shoe: {shoe_id}")
 
-    # Mark Assessment "Done" as soon as we see the Lovable link. Runs before
-    # the Supabase fetch so it executes even when the snapshot isn't visible
-    # yet (Lovable write-order race). Failure here is non-fatal — the rest of
-    # the pipeline continues and a future process_task run will retry.
+    # Mark Assessment "Done" and set Service Type as soon as we see the
+    # Lovable link. Both are derivable from the description alone (no Supabase
+    # fetch needed), so they run before the Supabase fetch — that way they
+    # land even when the snapshot isn't visible yet (Lovable write-order
+    # race). Service Type is BagCare when the description explicitly says
+    # `Size: Check Attachments` (bag flow), else ShoeCare. Failure here is
+    # non-fatal — the rest of the pipeline continues and a future
+    # process_task run will retry.
+    early_fields: dict = {ASSESSMENT_FIELD_GID: ASSESSMENT_DONE_OPTION_GID}
+    service_type_label = "BagCare" if "Size: Check Attachments" in notes else "ShoeCare"
+    service_type_field_gid = _field_gid_by_name("Service Type")
+    if service_type_field_gid:
+        st_option_gid = _option_gid(service_type_field_gid, service_type_label)
+        if st_option_gid:
+            early_fields[service_type_field_gid] = st_option_gid
+        else:
+            print(f"  Service Type: option {service_type_label!r} not found; skipping")
+    else:
+        print("  Service Type: field not found in project; skipping")
     try:
-        update_task(task_id, {"custom_fields": {ASSESSMENT_FIELD_GID: ASSESSMENT_DONE_OPTION_GID}})
+        update_task(task_id, {"custom_fields": early_fields})
         print("  Assessment: marked Done")
+        if service_type_field_gid in early_fields:
+            print(f"  Service Type: {service_type_label}")
     except Exception as e:
-        print(f"  Assessment: update failed ({e}); continuing")
+        print(f"  Assessment / Service Type: update failed ({e}); continuing")
 
     # 3. Fetch from Supabase
     print("Fetching shoe data from Supabase...")
