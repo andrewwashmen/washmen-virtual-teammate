@@ -477,19 +477,14 @@ def sync_description_and_fields(task_id: str, current_data: dict, current_snap: 
             due_now = approved + timedelta(days=tat)
             payload["due_on"] = due_now.isoformat()
 
-    # Service → custom field mappings. Approved-derived fields fully overwrite,
-    # sorter-derived fields preserve. Same shared helper used by process_task.
-    service_field_payload = pt.compute_service_field_mappings(current_data, task.get("custom_fields"))
-    if service_field_payload:
-        payload.setdefault("custom_fields", {}).update(service_field_payload)
-
-    # Re-derive Service Type from the current description on every sync. The
-    # initial process_task set it from the description at the time of the
-    # first link; if the description has since changed (e.g. an operator
-    # added/changed the size), this keeps the field in lockstep.
-    payload.setdefault("custom_fields", {}).update(
-        pt.derive_service_type_payload(notes)
-    )
+    # Merge in: snapshot-derived service field mappings (approved-derived
+    # fields fully overwrite, sorter-derived preserve) AND description-derived
+    # fields (Service Type enum + Brand/Colour/Size text), so a re-posted
+    # Lovable link with changed scope, item type, or size lands in Asana.
+    cf = payload.setdefault("custom_fields", {})
+    cf.update(pt.compute_service_field_mappings(current_data, task.get("custom_fields")))
+    cf.update(pt.derive_service_type_payload(notes))
+    cf.update(pt.derive_description_text_payload(notes))
 
     print(f"  update description + custom fields"
           + (f" (due {due_was} -> {due_now})" if due_now and due_now != due_was else ""))

@@ -817,6 +817,49 @@ def _field_gid_by_name(field_name: str) -> Optional[str]:
     return _FIELD_NAME_CACHE.get((field_name or "").strip().lower())
 
 
+# Description-key → Asana custom field display name. Mirrored on every Lovable
+# update from the structured `Key:\n  Value\n` blocks the upstream system
+# writes at the top of the task notes. Only text fields are mirrored here;
+# Service Type (enum) is handled by `derive_service_type_payload`.
+DESCRIPTION_TEXT_FIELDS: dict[str, str] = {
+    "Brand": "Brand",
+    "Color": "Colour",  # Asana field uses British spelling
+    "Size":  "Size",
+}
+
+
+def derive_description_text_payload(notes: str) -> dict:
+    """Re-derive Brand / Colour / Size from the task description.
+
+    The upstream system writes the description as block-style key-value
+    pairs (e.g. `Brand:\\n  Balmain\\n`). We mirror those values into the
+    matching text custom fields on every Lovable update so changes the
+    upstream system makes after task creation reach Asana even when it
+    doesn't re-set the custom fields directly. Missing or empty values
+    are skipped — we don't clear a field just because the key wasn't
+    present this run (defensive against upstream-format drift).
+    """
+    payload: dict = {}
+    notes = notes or ""
+    for desc_key, field_name in DESCRIPTION_TEXT_FIELDS.items():
+        m = re.search(
+            rf"^\s*{re.escape(desc_key)}:\s*\n\s*(.+?)\s*$",
+            notes, re.MULTILINE,
+        )
+        if not m:
+            continue
+        value = m.group(1).strip()
+        if not value or value.lower() == "none":
+            continue
+        field_gid = _field_gid_by_name(field_name)
+        if not field_gid:
+            print(f"  {field_name}: field not found in project; skipping")
+            continue
+        payload[field_gid] = value
+        print(f"  {field_name}: {value!r}")
+    return payload
+
+
 def derive_service_type_payload(notes: str) -> dict:
     """Return a custom_fields payload setting Service Type from the description.
 
@@ -1020,6 +1063,7 @@ def process_task(task_id: str) -> None:
     # pipeline continues and a future process_task run will retry.
     early_fields: dict = {ASSESSMENT_FIELD_GID: ASSESSMENT_DONE_OPTION_GID}
     early_fields.update(derive_service_type_payload(notes))
+    early_fields.update(derive_description_text_payload(notes))
     try:
         update_task(task_id, {"custom_fields": early_fields})
         print("  Assessment: marked Done")
